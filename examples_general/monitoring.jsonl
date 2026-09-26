@@ -1,0 +1,4 @@
+{"Time":"2026-01-01T09:00:00","Temperature(K)":298.15,"Voltage(V)":1.21,"Status":"start"}
+{"Time":"2026-01-01T09:00:10","Temperature(K)":300.15,"Voltage(V)":1.25,"Status":"running"}
+{"Time":"2026-01-01T09:00:20","Temperature(K)":null,"Voltage(V)":1.28,"Status":"sensor missing"}
+{"Time":"2026-01-01T09:00:30","Temperature(K)":304.15,"Voltage(V)":1.31,"Status":"end"}

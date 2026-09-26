@@ -1,0 +1,985 @@
+"""Tk interface for importing general tabular data into Origin or Excel."""
+
+from __future__ import annotations
+
+import copy
+import json
+import multiprocessing
+import os
+import queue
+import subprocess
+import sys
+import threading
+from pathlib import Path
+from tkinter import filedialog, messagebox, ttk
+import tkinter as tk
+from typing import Any
+
+from . import planning
+from .readers import SUPPORTED_EXTENSIONS, discover_files
+from .worker import import_worker
+
+
+SUPPORTED_SUFFIXES = SUPPORTED_EXTENSIONS
+PLAN_SCHEMA_VERSION = 1
+_FORMAT_SUFFIX = {"opju": ".opju", "xlsx": ".xlsx"}
+_DELIMITER_OPTIONS = ("自动识别", "逗号 ,", "制表符 \\t", "分号 ;", "空白分隔")
+
+
+def _normalized_path(path: str | Path) -> str:
+    return os.path.normcase(str(Path(path).expanduser().resolve(strict=False)))
+
+
+def _source_key(source: dict[str, Any], base_dir: Path | None = None) -> tuple[str, str | None]:
+    options = source.get("options") or {}
+    sheet = options.get("sheet", source.get("sheet"))
+    return _normalized_path(_resolve_plan_path(source["path"], base_dir)), str(sheet) if sheet is not None else None
+
+
+def _plan_table_key(table: dict[str, Any], base_dir: Path | None = None) -> tuple[str, str | None]:
+    return _source_key(table["source"], base_dir)
+
+
+def _selector_index(selector: Any, columns: list[dict[str, Any]]) -> int | None:
+    if selector is None:
+        return None
+    if isinstance(selector, int) and not isinstance(selector, bool):
+        return selector if 0 <= selector < len(columns) else None
+    text = str(selector)
+    for column in columns:
+        if column.get("name") == text:
+            return int(column["index"])
+    return None
+
+
+def _read_options(header: str, skip_rows: str | int, delimiter: str) -> dict[str, Any]:
+    """Convert visible controls to the stable reader options contract."""
+    header_option: str | bool = "auto" if header == "自动" else header == "有标题行"
+    delimiter_option = {
+        "自动识别": "auto",
+        "逗号 ,": ",",
+        "制表符 \\t": "\t",
+        "分号 ;": ";",
+        "空白分隔": "whitespace",
+    }.get(delimiter, "auto")
+    return {
+        "sheet": None,
+        "header": header_option,
+        "skip_rows": int(skip_rows),
+        "delimiter": delimiter_option,
+        "encoding": "auto",
+        "missing_values": [""],
+        "formula_policy": "cached",
+    }
+
+
+def _collect_supported(paths: list[str | Path]) -> tuple[list[Path], list[str]]:
+    """Expand dropped folders, filter supported data files, and deduplicate."""
+    found: list[Path] = []
+    rejected: list[str] = []
+    seen: set[str] = set()
+    for raw_path in paths:
+        path = Path(raw_path).expanduser()
+        if not path.exists():
+            raise FileNotFoundError(f"数据源不存在：{path}")
+        if path.is_file() and path.suffix.lower() not in SUPPORTED_SUFFIXES:
+            rejected.append(str(path))
+            continue
+        try:
+            candidates = discover_files([path.resolve()])
+        except ValueError as exc:
+            if path.is_dir():
+                rejected.append(f"{path}（{exc}）")
+                continue
+            raise
+        for candidate in candidates:
+            key = _normalized_path(candidate)
+            if key not in seen:
+                seen.add(key)
+                found.append(candidate)
+    return found, rejected
+
+
+def _resolve_plan_path(raw_path: str | Path, base_dir: Path | None) -> Path:
+    path = Path(raw_path).expanduser()
+    if not path.is_absolute() and base_dir is not None:
+        path = base_dir / path
+    return path.resolve(strict=False)
+
+
+def _default_output_for(paths: list[Path], fmt: str) -> Path:
+    """Choose an output beside the first source without replacing an input workbook."""
+    suffix = _FORMAT_SUFFIX[fmt]
+    first = paths[0] if paths else Path.cwd() / "data_import"
+    candidate = first.parent / f"{first.stem}{suffix}"
+    input_keys = {_normalized_path(path) for path in paths}
+    if _normalized_path(candidate) in input_keys:
+        candidate = first.parent / f"{first.stem}_imported{suffix}"
+        serial = 2
+        while _normalized_path(candidate) in input_keys:
+            candidate = first.parent / f"{first.stem}_imported_{serial}{suffix}"
+            serial += 1
+    return candidate
+
+
+def _validate_plan_save_target(plan: dict[str, Any], target: Path, base_dir: Path | None) -> None:
+    """Reject plan paths that could overwrite an input or planned output."""
+    target_key = _normalized_path(target)
+    for item in plan.get("tables", []):
+        source = item.get("source", {})
+        source_path = _resolve_plan_path(source.get("path", ""), base_dir)
+        if target_key == _normalized_path(source_path):
+            raise ValueError(f"计划文件不能覆盖输入数据源：{source_path}")
+    output = plan.get("output", {})
+    if output.get("path"):
+        output_path = _resolve_plan_path(output["path"], base_dir)
+        if target_key == _normalized_path(output_path):
+            raise ValueError(f"计划文件不能覆盖计划输出文件：{output_path}")
+
+
+class GeneralDataApp:
+    """Inspect, configure, and import tabular data using a responsive Tk UI."""
+
+    def __init__(self, initial_files: list[Path] | None = None) -> None:
+        self.root = tk.Tk()
+        self.root.title("数据 → Origin 工程")
+        self.root.minsize(1020, 760)
+
+        self._paths: list[Path] = []
+        self._tables: list[dict[str, Any]] = []
+        self._tables_by_iid: dict[str, dict[str, Any]] = {}
+        self._plots: dict[tuple[str, str | None], dict[str, Any]] = {}
+        self._column_labels: dict[tuple[str, str | None], dict[str, Any]] = {}
+        self._loaded_plan: dict[str, Any] | None = None
+        self._plan_base_dir: Path | None = None
+        self._current_key: tuple[str, str | None] | None = None
+        self._current_table: dict[str, Any] | None = None
+        self._thread: threading.Thread | None = None
+        self._thread_queue: queue.Queue[dict[str, Any]] = queue.Queue()
+        self._thread_kind: str | None = None
+        self._import_process = None
+        self._import_recv = None
+        self._import_messages: list[dict[str, Any]] = []
+        self._busy = False
+        self._interactive: list[tk.Widget] = []
+        self._widget_states: dict[tk.Widget, str] = {}
+
+        self.header_var = tk.StringVar(value="自动")
+        self.skip_rows_var = tk.StringVar(value="0")
+        self.delimiter_var = tk.StringVar(value="自动识别")
+        self.plot_kind_var = tk.StringVar(value="line")
+        self.x_choice_var = tk.StringVar(value="行号")
+        self.error_choice_var = tk.StringVar(value="无")
+        self.title_var = tk.StringVar()
+        self.x_label_var = tk.StringVar()
+        self.y_label_var = tk.StringVar()
+        self.format_var = tk.StringVar(value="opju")
+        self.keep_open_var = tk.BooleanVar(value=False)
+        self.status_var = tk.StringVar(value="添加文件或文件夹后，先检查预览，再选择图形和输出格式。")
+
+        self._build()
+        self.root.protocol("WM_DELETE_WINDOW", self._on_close)
+        self.root.after(200, self._hook_drop)
+        if initial_files:
+            self._add_paths(initial_files, announce=False)
+
+    def run(self) -> None:
+        self.root.mainloop()
+
+    def _track(self, widget: tk.Widget) -> tk.Widget:
+        self._interactive.append(widget)
+        try:
+            self._widget_states[widget] = str(widget.cget("state")) or "normal"
+        except tk.TclError:
+            self._widget_states[widget] = "normal"
+        return widget
+
+    def _build(self) -> None:
+        outer = ttk.Frame(self.root, padding=10)
+        outer.pack(fill=tk.BOTH, expand=True)
+
+        top = ttk.Frame(outer)
+        top.pack(fill=tk.X)
+        ttk.Label(top, text="支持文本表格、Excel、JSON 和 JSONL；可把文件或文件夹拖到窗口。").pack(side=tk.LEFT, fill=tk.X, expand=True)
+        for label, command in (
+            ("添加文件", self.add_files),
+            ("添加文件夹", self.add_folder),
+            ("移除数据源", self.remove_selected_sources),
+        ):
+            self._track(ttk.Button(top, text=label, command=command)).pack(side=tk.LEFT, padx=(6, 0))
+
+        source_frame = ttk.LabelFrame(outer, text="数据表和工作表", padding=5)
+        source_frame.pack(fill=tk.BOTH, expand=True, pady=(8, 0))
+        self.table_tree = ttk.Treeview(
+            source_frame,
+            columns=("source", "sheet", "rows", "columns"),
+            show="headings",
+            height=6,
+            selectmode="browse",
+        )
+        for column, heading, width, anchor in (
+            ("source", "文件", 450, tk.W),
+            ("sheet", "工作表", 170, tk.W),
+            ("rows", "行数", 80, tk.E),
+            ("columns", "列数", 80, tk.E),
+        ):
+            self.table_tree.heading(column, text=heading)
+            self.table_tree.column(column, width=width, anchor=anchor, stretch=column == "source")
+        source_scroll = ttk.Scrollbar(source_frame, orient=tk.VERTICAL, command=self.table_tree.yview)
+        self.table_tree.configure(yscrollcommand=source_scroll.set)
+        self.table_tree.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
+        source_scroll.pack(side=tk.RIGHT, fill=tk.Y)
+        self.table_tree.bind("<<TreeviewSelect>>", self._on_table_selection)
+
+        read_frame = ttk.LabelFrame(outer, text="读取选项", padding=(7, 5))
+        read_frame.pack(fill=tk.X, pady=(7, 0))
+        ttk.Label(read_frame, text="标题行").pack(side=tk.LEFT)
+        self._track(ttk.Combobox(read_frame, state="readonly", width=10, textvariable=self.header_var, values=("自动", "有标题行", "无标题行"))).pack(side=tk.LEFT, padx=(4, 12))
+        ttk.Label(read_frame, text="跳过开头行").pack(side=tk.LEFT)
+        self._track(ttk.Spinbox(read_frame, from_=0, to=100000, width=8, textvariable=self.skip_rows_var)).pack(side=tk.LEFT, padx=(4, 12))
+        ttk.Label(read_frame, text="分隔符").pack(side=tk.LEFT)
+        self._track(ttk.Combobox(read_frame, state="readonly", width=14, textvariable=self.delimiter_var, values=_DELIMITER_OPTIONS)).pack(side=tk.LEFT, padx=(4, 10))
+        self._track(ttk.Button(read_frame, text="重新读取", command=self.reload_inputs)).pack(side=tk.LEFT)
+        ttk.Label(read_frame, text="修改这些设置后重新读取，计划会保存实际读取选项。", foreground="#555555").pack(side=tk.LEFT, padx=(12, 0))
+
+        preview_box = ttk.LabelFrame(outer, text="列信息与数据预览", padding=5)
+        preview_box.pack(fill=tk.BOTH, expand=True, pady=(7, 0))
+        preview_panes = ttk.Panedwindow(preview_box, orient=tk.HORIZONTAL)
+        preview_panes.pack(fill=tk.BOTH, expand=True)
+        meta_frame = ttk.Frame(preview_panes)
+        sample_frame = ttk.Frame(preview_panes)
+        preview_panes.add(meta_frame, weight=1)
+        preview_panes.add(sample_frame, weight=3)
+        self.column_tree = ttk.Treeview(meta_frame, columns=("index", "name", "kind", "unit", "missing"), show="headings", height=7)
+        for column, heading, width in (
+            ("index", "列", 40), ("name", "名称", 150), ("kind", "类型", 78), ("unit", "单位", 65), ("missing", "缺失", 65),
+        ):
+            self.column_tree.heading(column, text=heading)
+            self.column_tree.column(column, width=width, stretch=column == "name")
+        self.column_tree.pack(fill=tk.BOTH, expand=True)
+        self.sample_tree = ttk.Treeview(sample_frame, show="headings", height=7)
+        sample_y = ttk.Scrollbar(sample_frame, orient=tk.VERTICAL, command=self.sample_tree.yview)
+        sample_x = ttk.Scrollbar(sample_frame, orient=tk.HORIZONTAL, command=self.sample_tree.xview)
+        self.sample_tree.configure(yscrollcommand=sample_y.set, xscrollcommand=sample_x.set)
+        self.sample_tree.grid(row=0, column=0, sticky="nsew")
+        sample_y.grid(row=0, column=1, sticky="ns")
+        sample_x.grid(row=1, column=0, sticky="ew")
+        sample_frame.rowconfigure(0, weight=1)
+        sample_frame.columnconfigure(0, weight=1)
+
+        plot_box = ttk.LabelFrame(outer, text="当前表的绘图设置", padding=(7, 5))
+        plot_box.pack(fill=tk.X, pady=(7, 0))
+        row = ttk.Frame(plot_box)
+        row.pack(fill=tk.X)
+        ttk.Label(row, text="图形").pack(side=tk.LEFT)
+        self._track(ttk.Combobox(row, state="readonly", width=14, textvariable=self.plot_kind_var, values=("none", "line", "scatter", "line_symbol", "column"))).pack(side=tk.LEFT, padx=(4, 12))
+        ttk.Label(row, text="X 列").pack(side=tk.LEFT)
+        self.x_combo = self._track(ttk.Combobox(row, state="readonly", width=32, textvariable=self.x_choice_var, values=("行号",)))
+        self.x_combo.pack(side=tk.LEFT, padx=(4, 12))
+        ttk.Label(row, text="Y 列（可多选）").pack(side=tk.LEFT)
+        ttk.Label(row, text="误差列（单 Y）").pack(side=tk.LEFT, padx=(14, 0))
+        self.error_combo = self._track(ttk.Combobox(row, state="readonly", width=26, textvariable=self.error_choice_var, values=("无",)))
+        self.error_combo.pack(side=tk.LEFT, padx=(4, 0))
+        y_frame = ttk.Frame(plot_box)
+        y_frame.pack(fill=tk.X, pady=(4, 0))
+        self.y_list = tk.Listbox(y_frame, selectmode=tk.MULTIPLE, height=4, exportselection=False)
+        self.y_list.pack(side=tk.LEFT, fill=tk.X, expand=True)
+        self.y_list.bind("<<ListboxSelect>>", self._update_error_state)
+        y_scroll = ttk.Scrollbar(y_frame, orient=tk.VERTICAL, command=self.y_list.yview)
+        y_scroll.pack(side=tk.LEFT, fill=tk.Y)
+        self.y_list.configure(yscrollcommand=y_scroll.set)
+        label_row = ttk.Frame(plot_box)
+        label_row.pack(fill=tk.X, pady=(4, 0))
+        for label, var, width in (("图题", self.title_var, 30), ("X 轴标题", self.x_label_var, 25), ("Y 轴标题", self.y_label_var, 25)):
+            ttk.Label(label_row, text=label).pack(side=tk.LEFT)
+            self._track(ttk.Entry(label_row, textvariable=var, width=width)).pack(side=tk.LEFT, padx=(4, 12))
+
+        bottom = ttk.Frame(outer)
+        bottom.pack(fill=tk.X, pady=(8, 0))
+        format_frame = ttk.Frame(bottom)
+        format_frame.pack(side=tk.LEFT)
+        ttk.Label(format_frame, text="输出").pack(side=tk.LEFT)
+        self._track(ttk.Radiobutton(format_frame, text="Origin 工程 (.opju)", value="opju", variable=self.format_var, command=self._format_changed)).pack(side=tk.LEFT, padx=(8, 0))
+        self._track(ttk.Radiobutton(format_frame, text="Excel 工作簿 (.xlsx)", value="xlsx", variable=self.format_var, command=self._format_changed)).pack(side=tk.LEFT, padx=(8, 0))
+        self.keep_open_check = self._track(ttk.Checkbutton(format_frame, text="Origin 完成后保持打开", variable=self.keep_open_var))
+        self.keep_open_check.pack(side=tk.LEFT, padx=(12, 0))
+
+        actions = ttk.Frame(bottom)
+        actions.pack(side=tk.RIGHT)
+        self._track(ttk.Button(actions, text="加载计划 JSON", command=self.load_plan)).pack(side=tk.LEFT, padx=(0, 5))
+        self._track(ttk.Button(actions, text="保存计划 JSON", command=self.save_plan)).pack(side=tk.LEFT, padx=(0, 5))
+        self._track(ttk.Button(actions, text="批量谱线模式", command=self.open_spectra_gui)).pack(side=tk.LEFT, padx=(0, 5))
+        self.export_button = self._track(ttk.Button(actions, text="创建文件…", command=self.export_data))
+        self.export_button.pack(side=tk.LEFT)
+        self._format_changed()
+
+        ttk.Label(outer, textvariable=self.status_var, wraplength=980, justify=tk.LEFT).pack(fill=tk.X, pady=(8, 0))
+
+    def _hook_drop(self) -> None:
+        try:
+            import spectra_to_origin as sto
+
+            sto.enable_windows_file_drop(self.root, self._on_drop_paths)
+        except Exception:
+            return
+
+    def _on_drop_paths(self, paths: list[str]) -> None:
+        if not self._busy:
+            self._add_paths(paths)
+
+    def add_files(self) -> None:
+        selected = filedialog.askopenfilenames(
+            parent=self.root,
+            title="选择数据文件",
+            filetypes=(("支持的数据文件", "*.txt *.dat *.xy *.csv *.tsv *.xlsx *.xlsm *.xls *.json *.jsonl *.ndjson"), ("所有文件", "*.*")),
+        )
+        if selected:
+            self._add_paths(list(selected))
+
+    def add_folder(self) -> None:
+        folder = filedialog.askdirectory(parent=self.root, title="选择包含数据文件的文件夹", mustexist=True)
+        if folder:
+            self._add_paths([folder])
+
+    def _add_paths(self, raw_paths: list[str | Path], announce: bool = True) -> None:
+        try:
+            paths, rejected = _collect_supported(raw_paths)
+        except Exception as exc:
+            messagebox.showerror("无法读取数据源", str(exc), parent=self.root)
+            return
+        existing = {_normalized_path(path) for path in self._paths}
+        added = [path for path in paths if _normalized_path(path) not in existing]
+        if rejected:
+            messagebox.showwarning("忽略不支持的文件", "以下文件格式不在支持列表中：\n" + "\n".join(rejected[:8]), parent=self.root)
+        if not added:
+            if announce and not rejected:
+                self.status_var.set("没有发现新的支持格式文件。")
+            return
+        self._save_current_plot()
+        self._paths.extend(added)
+        self._loaded_plan = None
+        self._plan_base_dir = None
+        self._inspect_paths()
+
+    def remove_selected_sources(self) -> None:
+        selected = self.table_tree.selection()
+        if not selected or self._busy:
+            return
+        self._save_current_plot()
+        remove_keys = {_normalized_path(self._tables_by_iid[iid]["source"]["path"]) for iid in selected}
+        self._paths = [path for path in self._paths if _normalized_path(path) not in remove_keys]
+        self._tables = [table for table in self._tables if _normalized_path(table["source"]["path"]) not in remove_keys]
+        self._loaded_plan = None
+        self._plan_base_dir = None
+        self._plots = {key: plot for key, plot in self._plots.items() if key[0] not in remove_keys}
+        self._populate_tables(self._tables)
+        if self._paths:
+            self._inspect_paths()
+        else:
+            self._show_table(None)
+            self.status_var.set("已移除数据源。")
+
+    def reload_inputs(self) -> None:
+        if not self._paths or self._busy:
+            return
+        self._save_current_plot()
+        self._loaded_plan = None
+        self._plan_base_dir = None
+        self._inspect_paths()
+
+    def _inspect_paths(self) -> None:
+        try:
+            options = _read_options(self.header_var.get(), self.skip_rows_var.get(), self.delimiter_var.get())
+        except (ValueError, tk.TclError) as exc:
+            messagebox.showerror("读取选项无效", f"跳过行数必须是非负整数：{exc}", parent=self.root)
+            return
+        if options["skip_rows"] < 0:
+            messagebox.showerror("读取选项无效", "跳过行数必须大于或等于 0。", parent=self.root)
+            return
+        paths = [str(path) for path in self._paths]
+        self.status_var.set("正在检查文件并读取数据预览…")
+
+        def inspect_task() -> None:
+            try:
+                result = planning.inspect_inputs(paths, options=options)
+                self._thread_queue.put({"kind": "inspect", "result": result})
+            except Exception as exc:
+                self._thread_queue.put({"kind": "inspect", "error": str(exc)})
+
+        self._start_thread(inspect_task, "inspect")
+
+    def _inspect_plan_sources(self, plan: dict[str, Any]) -> None:
+        plan_tables = copy.deepcopy(plan["tables"])
+        self.status_var.set("正在重新读取导入计划中的文件和工作表…")
+
+        def inspect_task() -> None:
+            inspected: list[dict[str, Any]] = []
+            try:
+                for plan_table in plan_tables:
+                    source = plan_table["source"]
+                    options = dict(source.get("options") or {})
+                    source_path = _resolve_plan_path(source["path"], self._plan_base_dir)
+                    result = planning.inspect_inputs([source_path], options=options)
+                    inspected.extend(result.get("tables", []))
+                self._thread_queue.put({"kind": "load_plan", "tables": inspected})
+            except Exception as exc:
+                self._thread_queue.put({"kind": "load_plan", "error": str(exc)})
+
+        self._start_thread(inspect_task, "load_plan")
+
+    def _start_thread(self, target, kind: str) -> None:
+        if self._busy:
+            return
+        self._set_busy(True)
+        self._thread_kind = kind
+        self._thread = threading.Thread(target=target, name=f"origin-bridge-{kind}", daemon=True)
+        self._thread.start()
+        self.root.after(80, self._poll_thread)
+
+    def _poll_thread(self) -> None:
+        try:
+            message = self._thread_queue.get_nowait()
+        except queue.Empty:
+            thread = self._thread
+            if thread is not None and thread.is_alive():
+                self.root.after(80, self._poll_thread)
+                return
+            if thread is not None:
+                thread.join()
+            try:
+                message = self._thread_queue.get_nowait()
+            except queue.Empty:
+                self._thread = None
+                self._set_busy(False)
+                return
+        if message is not None:
+            self._thread = None
+            self._set_busy(False)
+            kind = message.get("kind")
+            if message.get("error"):
+                self.status_var.set("读取失败。")
+                messagebox.showerror("数据读取失败", message["error"], parent=self.root)
+            elif kind == "inspect":
+                result = message["result"]
+                tables = result.get("tables", [])
+                self._tables = tables
+                for table in tables:
+                    key = _source_key(table["source"])
+                    self._plots.setdefault(key, copy.deepcopy(table.get("suggested_plot") or self._default_plot(table)))
+                self._populate_tables(tables)
+                warnings = list(result.get("warnings", []))
+                warnings.extend(
+                    warning
+                    for table in tables
+                    for warning in table.get("warnings", [])
+                )
+                self.status_var.set(f"已读取 {len(tables)} 个数据表。" + (" " + "；".join(map(str, warnings)) if warnings else ""))
+            elif kind == "load_plan":
+                tables = message["tables"]
+                self._tables = tables
+                self._populate_tables(tables)
+                self.status_var.set(f"计划数据已读取，共 {len(tables)} 个数据表；导出前会再次验证源文件。")
+            return
+
+    @staticmethod
+    def _default_plot(table: dict[str, Any]) -> dict[str, Any]:
+        columns = table.get("columns", [])
+        numeric = [int(column["index"]) for column in columns if column.get("kind") == "number"]
+        if len(numeric) >= 2:
+            x_index, y_indexes, kind = numeric[0], [numeric[1]], "line"
+        elif numeric:
+            x_index, y_indexes, kind = None, [numeric[0]], "line"
+        else:
+            x_index, y_indexes, kind = None, [], "none"
+        return {
+            "kind": kind,
+            "x": x_index,
+            "y": y_indexes,
+            "y_error": {},
+            "title": table.get("name", ""),
+            "x_label": str(columns[0].get("name", "")) if columns else "",
+            "y_label": "",
+        }
+
+    def _populate_tables(self, tables: list[dict[str, Any]]) -> None:
+        self.table_tree.delete(*self.table_tree.get_children())
+        self._tables_by_iid.clear()
+        for index, table in enumerate(tables):
+            source = table.get("source", {})
+            iid = str(index)
+            self._tables_by_iid[iid] = table
+            self.table_tree.insert(
+                "",
+                tk.END,
+                iid=iid,
+                values=(source.get("path", ""), source.get("sheet") or "", table.get("n_rows", ""), len(table.get("columns", []))),
+            )
+        if tables:
+            first = str(0)
+            self.table_tree.selection_set(first)
+            self.table_tree.focus(first)
+            self._select_table(self._tables_by_iid[first])
+        else:
+            self._show_table(None)
+
+    def _on_table_selection(self, _event=None) -> None:
+        if self._busy:
+            return
+        self._save_current_plot()
+        selection = self.table_tree.selection()
+        self._select_table(self._tables_by_iid[selection[0]] if selection else None)
+
+    def _select_table(self, table: dict[str, Any] | None) -> None:
+        self._current_key = _source_key(table["source"]) if table else None
+        self._current_table = table
+        self._show_table(table)
+
+    def _show_table(self, table: dict[str, Any] | None) -> None:
+        self.column_tree.delete(*self.column_tree.get_children())
+        self.sample_tree.delete(*self.sample_tree.get_children())
+        if table is None:
+            self.sample_tree.configure(columns=())
+            self.sample_tree["show"] = "headings"
+            self.y_list.delete(0, tk.END)
+            self.x_combo.configure(values=("行号",))
+            self.error_combo.configure(values=("无",))
+            return
+
+        columns = table.get("columns", [])
+        for col in columns:
+            self.column_tree.insert("", tk.END, values=(col.get("index", ""), col.get("name", ""), col.get("kind", ""), col.get("unit", ""), col.get("missing", "")))
+
+        sample_ids = [f"c{index}" for index in range(len(columns))]
+        self.sample_tree.configure(columns=sample_ids)
+        for index, col in enumerate(columns):
+            label = str(col.get("name", f"Column {index + 1}"))
+            self.sample_tree.heading(sample_ids[index], text=label)
+            self.sample_tree.column(sample_ids[index], width=125, minwidth=70, stretch=False)
+        samples = [col.get("sample") or [] for col in columns]
+        row_count = min(12, max((len(values) for values in samples), default=0))
+        for row_index in range(row_count):
+            values = [str(sample[row_index]) if row_index < len(sample) and sample[row_index] is not None else "" for sample in samples]
+            self.sample_tree.insert("", tk.END, values=values)
+
+        labels = [f"{col.get('index')}: {col.get('name', '')} ({col.get('kind', '')})" for col in columns]
+        self.x_combo.configure(values=("行号", *labels))
+        numeric_columns = [col for col in columns if str(col.get("kind", "")).lower() in {"number", "numeric", "float", "integer", "int"}]
+        numeric = [f"{col.get('index')}: {col.get('name', '')} ({col.get('kind', '')})" for col in numeric_columns]
+        self.y_list.delete(0, tk.END)
+        for value in numeric:
+            self.y_list.insert(tk.END, value)
+        error_labels = [f"{col.get('index')}: {col.get('name', '')} ({col.get('kind', '')})" for col in numeric_columns]
+        self.error_combo.configure(values=("无", *error_labels))
+        self._load_plot_controls(table, numeric)
+
+    def _load_plot_controls(self, table: dict[str, Any], numeric: list[str]) -> None:
+        key = _source_key(table["source"])
+        plot = copy.deepcopy(self._plots.get(key) or table.get("suggested_plot") or self._default_plot(table))
+        columns = table.get("columns", [])
+        self.plot_kind_var.set(str(plot.get("kind", "line")))
+        x_index = _selector_index(plot.get("x"), columns)
+        self.x_choice_var.set("行号" if x_index is None else self._selector_label(x_index, columns))
+        ys = plot.get("y", []) or []
+        if not isinstance(ys, list):
+            ys = [ys]
+        self.y_list.selection_clear(0, tk.END)
+        numeric_indexes = [int(label.split(":", 1)[0]) for label in numeric]
+        for selector in ys:
+            index = _selector_index(selector, columns)
+            if index in numeric_indexes:
+                self.y_list.selection_set(numeric_indexes.index(index))
+        error_selector: Any = None
+        error_mapping = plot.get("y_error", {}) or {}
+        if len(ys) == 1 and isinstance(error_mapping, dict):
+            y_index = _selector_index(ys[0], columns)
+            if y_index is not None:
+                error_selector = error_mapping.get(str(columns[y_index].get("name", "")))
+        error_index = _selector_index(error_selector, columns)
+        self.error_choice_var.set("无" if error_index is None else self._selector_label(error_index, columns))
+        self.title_var.set(str(plot.get("title", table.get("name", ""))))
+        self.x_label_var.set(str(plot.get("x_label", "")))
+        self.y_label_var.set(str(plot.get("y_label", "")))
+        self._update_error_state()
+
+    @staticmethod
+    def _selector_label(index: int, columns: list[dict[str, Any]]) -> str:
+        if 0 <= index < len(columns):
+            col = columns[index]
+            return f"{col.get('index', index)}: {col.get('name', '')} ({col.get('kind', '')})"
+        return "行号"
+
+    @staticmethod
+    def _display_index(value: str) -> int | None:
+        if value == "行号" or ":" not in value:
+            return None
+        try:
+            return int(value.split(":", 1)[0])
+        except ValueError:
+            return None
+
+    def _save_current_plot(self) -> None:
+        key = self._current_key
+        if key is None:
+            return
+        selected_y = [self.y_list.get(index) for index in self.y_list.curselection()]
+        y_indexes = [index for value in selected_y if (index := self._display_index(value)) is not None]
+        error_index = self._display_index(self.error_choice_var.get())
+        kind = self.plot_kind_var.get() or "none"
+        columns = (self._current_table or {}).get("columns", [])
+        x_index = None if kind == "none" else self._display_index(self.x_choice_var.get())
+        if kind == "none":
+            y_indexes = []
+        y_error = {}
+        if len(y_indexes) == 1 and error_index is not None and y_indexes[0] < len(columns):
+            y_error[str(columns[y_indexes[0]].get("name", y_indexes[0]))] = error_index
+        plot: dict[str, Any] = {
+            "kind": kind,
+            "x": x_index,
+            "y": y_indexes,
+            "y_error": y_error,
+            "title": self.title_var.get(),
+            "x_label": self.x_label_var.get(),
+            "y_label": self.y_label_var.get(),
+        }
+        self._plots[key] = plot
+
+    def _update_error_state(self, _event=None) -> None:
+        single_y = len(self.y_list.curselection()) == 1
+        if not single_y:
+            self.error_choice_var.set("无")
+        try:
+            self.error_combo.configure(state="readonly" if single_y else "disabled")
+        except tk.TclError:
+            pass
+
+    def _format_changed(self) -> None:
+        is_origin = self.format_var.get() == "opju"
+        if not is_origin:
+            self.keep_open_var.set(False)
+        state = "normal" if is_origin else "disabled"
+        try:
+            self.keep_open_check.configure(state=state)
+            self._widget_states[self.keep_open_check] = state
+        except (AttributeError, tk.TclError):
+            pass
+
+    def _effective_plan(self, output: Path, fmt: str, overwrite: bool) -> dict[str, Any]:
+        self._save_current_plot()
+        expected_suffix = _FORMAT_SUFFIX.get(fmt)
+        if expected_suffix is None:
+            raise ValueError(f"不支持的输出格式：{fmt}")
+        if output.suffix.lower() != expected_suffix:
+            output = output.with_suffix(expected_suffix)
+        if self._loaded_plan is not None:
+            plan = copy.deepcopy(self._loaded_plan)
+            active_paths = {_normalized_path(path) for path in self._paths}
+            plan["tables"] = [
+                table for table in plan["tables"]
+                if _normalized_path(_resolve_plan_path(table["source"]["path"], self._plan_base_dir)) in active_paths
+            ]
+        else:
+            if not self._paths:
+                raise ValueError("请先添加至少一个数据文件。")
+            input_keys = {_normalized_path(path) for path in self._paths}
+            inspected_keys = {_source_key(table["source"])[0] for table in self._tables}
+            missing = input_keys - inspected_keys
+            if missing:
+                raise ValueError("有数据源尚未完成读取。请点击“重新读取”并等待完成后再保存计划或导出。")
+            plan_tables = []
+            for table in self._tables:
+                source = table["source"]
+                key = _source_key(source)
+                plan_tables.append({
+                    "source": {field: source[field] for field in ("path", "sha256", "options")},
+                    "name": table["name"],
+                    "plot": copy.deepcopy(self._plots.get(key) or table.get("suggested_plot") or self._default_plot(table)),
+                    "column_labels": copy.deepcopy(self._column_labels.get(key, {})),
+                })
+            plan = {
+                "schema_version": PLAN_SCHEMA_VERSION,
+                "output": {
+                    "path": str(output.resolve()),
+                    "format": fmt,
+                    "overwrite": bool(overwrite),
+                    "keep_open": bool(self.keep_open_var.get()) if fmt == "opju" else False,
+                },
+                "tables": plan_tables,
+            }
+        if not isinstance(plan, dict) or plan.get("schema_version") != PLAN_SCHEMA_VERSION:
+            raise ValueError("规划模块返回了不支持的导入计划版本。")
+        plan_output = plan.get("output")
+        if not isinstance(plan_output, dict):
+            raise ValueError("导入计划缺少有效的 output 对象。")
+        plan_output.update({
+            "path": str(output.resolve()),
+            "format": fmt,
+            "overwrite": bool(overwrite),
+            "keep_open": bool(self.keep_open_var.get()) if fmt == "opju" else False,
+        })
+        if not plan.get("tables"):
+            raise ValueError("导入计划没有可导入的数据表。")
+        for item in plan["tables"]:
+            key = _plan_table_key(item, self._plan_base_dir if self._loaded_plan is not None else None)
+            if key in self._plots:
+                item["plot"] = copy.deepcopy(self._plots[key])
+            item.setdefault("column_labels", {})
+        return plan
+
+    def _default_output_path(self, fmt: str) -> Path:
+        return _default_output_for(self._paths, fmt)
+
+    def export_data(self) -> None:
+        if self._busy:
+            return
+        fmt = self.format_var.get()
+        if fmt not in _FORMAT_SUFFIX:
+            messagebox.showerror("输出格式无效", "请选择 Origin 工程或 Excel 工作簿。", parent=self.root)
+            return
+        if not self._paths and self._loaded_plan is None:
+            messagebox.showinfo("没有数据", "请先添加数据文件或加载导入计划。", parent=self.root)
+            return
+        if fmt == "opju":
+            try:
+                import spectra_to_origin as sto
+
+                if sto.origin_process_running():
+                    messagebox.showwarning("请先关闭 Origin", "检测到 Origin 正在运行。请先保存并关闭当前 Origin 工程，再重新创建文件；程序不会重置当前会话。", parent=self.root)
+                    return
+            except Exception as exc:
+                messagebox.showerror("Origin 状态检查失败", str(exc), parent=self.root)
+                return
+        raw_output = filedialog.asksaveasfilename(
+            parent=self.root,
+            title="选择输出文件",
+            defaultextension=_FORMAT_SUFFIX[fmt],
+            initialfile=self._default_output_path(fmt).name,
+            initialdir=str(self._default_output_path(fmt).parent),
+            filetypes=(("Origin 工程", "*.opju"),) if fmt == "opju" else (("Excel 工作簿", "*.xlsx"),),
+        )
+        if not raw_output:
+            return
+        output = Path(raw_output).expanduser()
+        if output.suffix.lower() != _FORMAT_SUFFIX[fmt]:
+            output = output.with_suffix(_FORMAT_SUFFIX[fmt])
+        if _normalized_path(output) in {_normalized_path(path) for path in self._paths}:
+            messagebox.showerror("输出路径冲突", "输出文件不能与任何输入数据源相同。", parent=self.root)
+            return
+        overwrite = False
+        if output.exists():
+            if not messagebox.askyesno("确认覆盖", f"文件已存在：\n{output}\n\n确认覆盖该文件吗？", parent=self.root):
+                return
+            overwrite = True
+        try:
+            plan = self._effective_plan(output, fmt, overwrite)
+        except Exception as exc:
+            messagebox.showerror("无法创建导入计划", str(exc), parent=self.root)
+            return
+        self.status_var.set("正在后台准备和导出；窗口仍可响应。")
+        try:
+            self._start_import(plan)
+        except Exception as exc:
+            self._set_busy(False)
+            messagebox.showerror("无法启动导出", str(exc), parent=self.root)
+            self.status_var.set("无法启动后台导出。")
+
+    def _start_import(self, plan: dict[str, Any]) -> None:
+        if self._busy:
+            return
+        context = multiprocessing.get_context("spawn")
+        recv_conn, send_conn = context.Pipe(duplex=False)
+        base_dir = self._plan_base_dir or Path.cwd()
+        process = context.Process(target=import_worker, args=(send_conn, plan, str(base_dir)))
+        try:
+            process.start()
+        except Exception:
+            recv_conn.close()
+            send_conn.close()
+            raise
+        send_conn.close()
+        self._import_recv = recv_conn
+        self._import_process = process
+        self._import_messages = []
+        self._set_busy(True)
+        self.root.after(100, self._poll_import)
+
+    def _poll_import(self) -> None:
+        process = self._import_process
+        recv_conn = self._import_recv
+        if process is None or recv_conn is None:
+            return
+        while True:
+            try:
+                if not recv_conn.poll():
+                    break
+                message = recv_conn.recv()
+                self._import_messages.append(message)
+                if message.get("type") == "progress":
+                    self.status_var.set(message.get("text", "正在导出…"))
+            except (EOFError, OSError):
+                break
+        if process.is_alive():
+            self.root.after(120, self._poll_import)
+            return
+        process.join()
+        result_messages = [message.get("result") for message in self._import_messages if message.get("type") == "result"]
+        exit_code = process.exitcode
+        process.close()
+        recv_conn.close()
+        self._import_process = None
+        self._import_recv = None
+        self._set_busy(False)
+        result = result_messages[-1] if result_messages else {"ok": False, "error": f"后台进程未返回结果（退出码 {exit_code}）。"}
+        if result.get("ok"):
+            output = result.get("output", {})
+            warnings = result.get("warnings", [])
+            path = output.get("path", "") if isinstance(output, dict) else str(output)
+            size = output.get("size_bytes") if isinstance(output, dict) else None
+            self.status_var.set(f"已创建：{path}" + (f"（{size:,} 字节）" if isinstance(size, int) else ""))
+            details = f"文件已创建：\n{path}"
+            if isinstance(size, int):
+                details += f"\n大小：{size:,} 字节"
+            if warnings:
+                details += "\n\n提示：\n" + "\n".join(map(str, warnings))
+            messagebox.showinfo("导入完成", details, parent=self.root)
+        else:
+            error = result.get("error", "导出失败")
+            self.status_var.set(f"导出失败：{error}")
+            messagebox.showerror("导入失败", str(error), parent=self.root)
+
+    def save_plan(self) -> None:
+        if self._busy:
+            return
+        if not self._paths and self._loaded_plan is None:
+            messagebox.showinfo("没有数据", "请先添加数据文件或加载导入计划。", parent=self.root)
+            return
+        fmt = self.format_var.get()
+        try:
+            if self._loaded_plan and isinstance(self._loaded_plan.get("output"), dict):
+                output = _resolve_plan_path(
+                    self._loaded_plan["output"].get("path") or self._default_output_path(fmt),
+                    self._plan_base_dir,
+                )
+            else:
+                output = self._default_output_path(fmt)
+            plan = self._effective_plan(output, fmt, False)
+        except Exception as exc:
+            messagebox.showerror("无法生成计划", str(exc), parent=self.root)
+            return
+        path = filedialog.asksaveasfilename(
+            parent=self.root,
+            title="保存导入计划",
+            defaultextension=".json",
+            initialfile=f"{output.stem}_import_plan.json",
+            filetypes=(("JSON 导入计划", "*.json"),),
+        )
+        if not path:
+            return
+        target = Path(path)
+        if target.suffix.lower() != ".json":
+            target = target.with_suffix(".json")
+        try:
+            _validate_plan_save_target(plan, target, self._plan_base_dir)
+        except ValueError as exc:
+            messagebox.showerror("不能保存计划", str(exc), parent=self.root)
+            return
+        if target.exists() and not messagebox.askyesno("确认覆盖", f"计划文件已存在：\n{target}\n\n确认覆盖吗？", parent=self.root):
+            return
+        try:
+            saved_plan = copy.deepcopy(plan)
+            for item in saved_plan["tables"]:
+                item["source"]["path"] = str(_resolve_plan_path(item["source"]["path"], self._plan_base_dir))
+            saved_plan["output"]["path"] = str(_resolve_plan_path(saved_plan["output"]["path"], self._plan_base_dir))
+            target.write_text(json.dumps(saved_plan, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+        except OSError as exc:
+            messagebox.showerror("保存失败", str(exc), parent=self.root)
+            return
+        self.status_var.set(f"导入计划已保存：{target}")
+
+    def load_plan(self) -> None:
+        if self._busy:
+            return
+        path = filedialog.askopenfilename(
+            parent=self.root,
+            title="加载导入计划",
+            filetypes=(("JSON 导入计划", "*.json"), ("所有文件", "*.*")),
+        )
+        if not path:
+            return
+        try:
+            plan = json.loads(Path(path).read_text(encoding="utf-8-sig"))
+            if not isinstance(plan, dict) or plan.get("schema_version") != PLAN_SCHEMA_VERSION:
+                raise ValueError("计划 schema_version 必须为 1。")
+            if not isinstance(plan.get("output"), dict) or not isinstance(plan.get("tables"), list):
+                raise ValueError("计划必须包含 output 对象和 tables 数组。")
+            if not plan["tables"]:
+                raise ValueError("计划没有可导入的数据表。")
+            for item in plan["tables"]:
+                if not isinstance(item, dict) or not isinstance(item.get("source"), dict) or not item["source"].get("path"):
+                    raise ValueError("计划中的每张表都必须包含 source.path。")
+            self._plan_base_dir = Path(path).resolve().parent
+            self._loaded_plan = plan
+            self._paths = list(dict.fromkeys(
+                _resolve_plan_path(item["source"]["path"], self._plan_base_dir) for item in plan["tables"]
+            ))
+            self._plots.clear()
+            self._column_labels.clear()
+            for item in plan["tables"]:
+                key = _plan_table_key(item, self._plan_base_dir)
+                if isinstance(item.get("plot"), dict):
+                    self._plots[key] = copy.deepcopy(item["plot"])
+                if isinstance(item.get("column_labels"), dict):
+                    self._column_labels[key] = copy.deepcopy(item["column_labels"])
+            output = plan["output"]
+            fmt = output.get("format", "opju")
+            self.format_var.set(fmt if fmt in _FORMAT_SUFFIX else "opju")
+            self._format_changed()
+            self.keep_open_var.set(bool(output.get("keep_open", False)))
+            options = plan["tables"][0]["source"].get("options") or {}
+            self._apply_read_options(options)
+            self._inspect_plan_sources(plan)
+        except Exception as exc:
+            messagebox.showerror("无法加载计划", str(exc), parent=self.root)
+
+    def _apply_read_options(self, options: dict[str, Any]) -> None:
+        header = options.get("header", "auto")
+        self.header_var.set("自动" if header == "auto" else "有标题行" if header is True else "无标题行")
+        self.skip_rows_var.set(str(options.get("skip_rows", 0)))
+        delimiter = options.get("delimiter", "auto")
+        label = {"auto": "自动识别", ",": "逗号 ,", "\t": "制表符 \\t", ";": "分号 ;", "whitespace": "空白分隔"}.get(delimiter, "自动识别")
+        self.delimiter_var.set(label)
+
+    def open_spectra_gui(self) -> None:
+        if self._busy:
+            return
+        try:
+            if getattr(sys, "frozen", False):
+                command = [sys.executable, "--spectra-gui"]
+            else:
+                script = Path(__file__).resolve().parent.parent / "spectra_to_origin.py"
+                command = [sys.executable, str(script), "--spectra-gui"]
+            subprocess.Popen(command, cwd=str(Path.cwd()))
+        except Exception as exc:
+            messagebox.showerror("无法打开批量谱线模式", str(exc), parent=self.root)
+
+    def _set_busy(self, busy: bool) -> None:
+        self._busy = busy
+        for widget in self._interactive:
+            state = "disabled" if busy else self._widget_states.get(widget, "normal")
+            try:
+                widget.configure(state=state)
+            except tk.TclError:
+                continue
+        self.y_list.configure(state=tk.DISABLED if busy else tk.NORMAL)
+        try:
+            self.table_tree.state(["disabled"] if busy else ["!disabled"])
+        except tk.TclError:
+            pass
+
+    def _on_close(self) -> None:
+        if self._busy:
+            messagebox.showwarning("任务进行中", "数据读取或导出仍在后台运行，请等待完成后再关闭窗口。", parent=self.root)
+            return
+        self.root.destroy()
+
+
+__all__ = ["GeneralDataApp"]

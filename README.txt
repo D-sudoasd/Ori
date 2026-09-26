@@ -1,26 +1,36 @@
-SpectraToOrigin 1.1.0
-====================
+Data to Origin
+==============
 
-把两列 XRD／光谱文件批量导入 Origin：每组一张工作表、一张曲线图。
-也可以不启动 Origin，直接导出全部分组的 Excel 和 CSV。
+把常见的表格数据导入 Origin Pro，生成 .opju 工程；也可只导出 Excel。
+源码新版默认打开通用数据窗口，可处理多列表格和 Excel 多工作表。
 
-1. 双击 run.bat，或运行构建好的 SpectraToOrigin.exe。
-2. 拖入 txt/dat/xy/csv/tsv 文件或文件夹，选中谱线查看预览。
-3. 选择自动布局、分组方式，填写坐标轴名称和单位。
-4. 点击生成 Origin 工程，或只导出 Excel/CSV。
+支持 TXT、DAT、XY、CSV、TSV、XLSX、XLSM、XLS、JSON、JSONL、NDJSON。
+数据可包含数值、文本、日期时间和缺失值。数据不会自动插值、拟合、平滑、
+单位换算或归一化。详细支持范围见 README.md。
 
-生成 .opju 需要安装并激活 Origin Pro；先保存并关闭已打开的 Origin。
-表格导出不需要 Origin。多组 CSV 位于“输出名_csv”文件夹，每组一个文件。
-本工具只整理和绘图，不做插值、拟合、平滑或强度归一化。
+开始使用（Python 3.10+，Windows）：
 
-源代码运行：
-py -3 -m pip install -r requirements.txt
-py -3 spectra_to_origin.py
+  py -3 -m pip install -r requirements.txt
+  py -3 spectra_to_origin.py
 
-检查演示数据：
-py -3 spectra_to_origin.py --check -i examples --group-by-name
+可把文件或文件夹路径传给程序，也可打开旧的 XRD／光谱批量导入窗口：
 
-只导出表格：
-py -3 spectra_to_origin.py --cli --xlsx-only -i examples -o demo.xlsx --n-groups 2
+  py -3 spectra_to_origin.py .\examples_general
+  py -3 spectra_to_origin.py --spectra-gui .\examples
 
-详细格式、参数、测试与构建说明请阅读 README.md。
+Agent 命令行检查、创建并校验导入计划：
+
+  py -3 -m origin_bridge inspect -i .\examples_general
+  py -3 -m origin_bridge plan -i .\examples_general\stress_strain.tsv -o .\out\stress.opju --save .\out\stress-plan.json
+  py -3 -m origin_bridge validate .\out\stress-plan.json
+  py -3 -m origin_bridge execute .\out\stress-plan.json
+
+也可安装 requirements-agent.txt 并启动 `python -m origin_bridge.mcp_server`，
+通过 MCP 客户端调用 inspect_data、create_import_plan、validate_import_plan、
+execute_import_plan。完整 agent 指南见 docs/agent-guide.md。
+
+生成 .opju 需要 Windows 上已安装并可用的 Origin Pro；已有 Origin 会话运行时
+程序会停止导出，以保护当前工程。导出 .xlsx 不需要 Origin。
+
+构建的 SpectraToOrigin.exe 打开通用 GUI；DataToOriginCLI.exe 输出命令行 JSON。
+MIT License。

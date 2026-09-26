@@ -35,7 +35,7 @@ EXCEL_MAX_ROWS = 1_048_576
 EXCEL_MAX_COLUMNS = 16_384
 EXCEL_HEADER_ROWS = 3
 CSV_MANIFEST_NAME = ".spectra-to-origin.json"
-__version__ = "1.1.0"
+__version__ = "2.0.0"
 
 _HEADER_TEMP = re.compile(r"温度\s+([0-9.]+)\s*C")
 _HEADER_TIME = re.compile(r"时效\s+([0-9.]+)\s*h")
@@ -2083,10 +2083,12 @@ def _positive_int(value: str) -> int:
 
 
 def build_parser() -> argparse.ArgumentParser:
-    parser = argparse.ArgumentParser(description="批量整理两列谱线，导出 Origin 工程或 Excel/CSV")
+    parser = argparse.ArgumentParser(description="通用数据导入 Origin；agent 子命令提供 JSON 接口；旧两列谱线参数仍可使用")
     parser.add_argument("--version", action="version", version=f"SpectraToOrigin {__version__}")
     parser.add_argument("--cli", action="store_true", help="不打开窗口，直接导出")
+    parser.add_argument("--spectra-gui", action="store_true", help="打开两列谱线批量分组窗口")
     parser.add_argument("-i", "--input", nargs="+", help="txt/dat/xy/csv/tsv 文件或文件夹")
+    parser.add_argument("files", nargs="*", help="启动时添加到窗口的文件或文件夹")
     parser.add_argument("-o", "--output", help="输出 .opju 或 .xlsx 路径")
     parser.add_argument("--layout", choices=["auto", "XYYY", "XYXY"], default="auto")
     grouping = parser.add_mutually_exclusive_group()
@@ -2183,15 +2185,26 @@ def _attach_console_if_cli(argv: list[str] | None) -> None:
 
 
 def main(argv: list[str] | None = None) -> int:
+    raw_args = list(argv if argv is not None else sys.argv[1:])
+    if raw_args and raw_args[0] == "agent":
+        if getattr(sys, "frozen", False):
+            _attach_console_if_cli(["--cli"])
+        from origin_bridge.cli import main as agent_main
+        return agent_main(raw_args[1:])
     _attach_console_if_cli(argv)
     args = build_parser().parse_args(argv)
+    args.input = [*(args.input or []), *args.files]
     if args.cli or args.check:
         return run_cli(args)
     _enable_windows_dpi()
     initial: list[Path] = []
-    if args.input:
-        initial = load_from_drop_payload([], args.input)
-    SpectraToOriginApp(initial).run()
+    if args.spectra_gui:
+        if args.input:
+            initial = load_from_drop_payload([], args.input)
+        SpectraToOriginApp(initial).run()
+    else:
+        from origin_bridge.gui import GeneralDataApp
+        GeneralDataApp(initial_files=[Path(value) for value in (args.input or [])]).run()
     return 0
 
 
