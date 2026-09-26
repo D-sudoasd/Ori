@@ -25,6 +25,19 @@ jobs:
       - run: python -m pip install -r requirements.txt
       - run: python -m unittest discover -v
 
+  agent-tools:
+    runs-on: windows-latest
+    env:
+      PYTHONUTF8: '1'
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-python@v7
+        with:
+          python-version: '3.13'
+          cache: pip
+      - run: python -m pip install -r requirements-agent.txt
+      - run: python -m unittest -v test_mcp_server
+
   windows-build:
     runs-on: windows-latest
     env:
@@ -43,8 +56,26 @@ jobs:
           $result = Start-Process -FilePath "$PWD\dist\SpectraToOrigin.exe" -ArgumentList '--cli --xlsx-only -i examples -o _test_out\packaged.xlsx --group-by-name' -WindowStyle Hidden -Wait -PassThru
           if ($result.ExitCode -ne 0) { exit $result.ExitCode }
           python -c "from openpyxl import load_workbook; from pathlib import Path; b=load_workbook('_test_out/packaged.xlsx'); assert b.sheetnames==['400C','500C','readme']; assert b['400C'].cell(7,3).value==48; assert b['500C'].cell(7,3).value==60; assert len(list(Path('_test_out/packaged_csv').glob('*.csv')))==2; b.close()"
+      - name: Verify packaged generic JSON workflow
+        shell: pwsh
+        run: |
+          $inspection = & .\dist\DataToOriginCLI.exe inspect -i examples_general
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          $data = ($inspection -join "`n") | ConvertFrom-Json
+          if (!$data.ok -or $data.tables.Count -ne 3) { throw 'Invalid generic inspection result' }
+          & .\dist\DataToOriginCLI.exe plan -i examples_general -o _test_out\generic.xlsx --save _test_out\generic-plan.json
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          & .\dist\DataToOriginCLI.exe validate _test_out\generic-plan.json
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          & .\dist\DataToOriginCLI.exe execute _test_out\generic-plan.json
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          python -c "from openpyxl import load_workbook; b=load_workbook('_test_out/generic.xlsx'); assert len(b.sheetnames)==4; b.close()"
+      - name: Verify packaged GUI background worker
+        run: python scripts/verify_packaged_worker.py
       - uses: actions/upload-artifact@v7
         with:
           name: SpectraToOrigin-Windows
-          path: dist/SpectraToOrigin.exe
+          path: |
+            dist/SpectraToOrigin.exe
+            dist/DataToOriginCLI.exe
           if-no-files-found: error

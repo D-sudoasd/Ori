@@ -12,3 +12,4 @@ if errorlevel 1 (
   exit /b 1
 )
 echo Built dist\SpectraToOrigin.exe
+echo Built dist\DataToOriginCLI.exe

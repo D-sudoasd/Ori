@@ -5,6 +5,7 @@ __pycache__/
 *.csv
 .pytest_cache/
 .venv/
+.venv-agent/
 venv/
 *.log
 _test_out/

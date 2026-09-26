@@ -1,0 +1,7 @@
+Strain(%)	Stress(MPa)	Error(MPa)	Sample
+0	0	0	Ti-A
+0.2	120	3	Ti-A
+0.4	235	4	Ti-A
+0.6	310	5	Ti-A
+0.8			Ti-A
+1.0	355	7	Ti-A

@@ -1,0 +1,5 @@
+[
+  {"Material": "Ti-A", "Yield strength(MPa)": 820, "Elongation(%)": 12.5},
+  {"Material": "Ti-B", "Yield strength(MPa)": 910, "Elongation(%)": 10.2},
+  {"Material": "Ti-C", "Yield strength(MPa)": 870, "Elongation(%)": 11.4}
+]
