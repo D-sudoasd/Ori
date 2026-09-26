@@ -19,6 +19,7 @@ from pathlib import Path
 from typing import Any
 
 from .models import DataColumn, DataImportError, DataTable
+from .dates import parse_iso_datetime
 
 
 SUPPORTED_EXTENSIONS = frozenset(
@@ -737,7 +738,7 @@ def _is_iso_datetime(value: str) -> bool:
     if not token or _is_numeric_token(token):
         return False
     try:
-        datetime.fromisoformat(token.replace("Z", "+00:00"))
+        parse_iso_datetime(token)
         return True
     except ValueError:
         try:

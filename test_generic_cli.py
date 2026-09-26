@@ -84,7 +84,7 @@ class GenericCliTests(unittest.TestCase):
             legacy.return_value.run.assert_called_once()
 
     def test_validation_exposes_numeric_and_date_conversion_limits_before_write(self):
-        self.source.write_text("Time,Value\n2026-01-01T00:00:00.123456,9007199254740993\n", encoding="utf-8")
+        self.source.write_text("Time,Value\n2026-01-01T00:00:00.123456789,9007199254740993\n", encoding="utf-8")
         saved = self.directory / "precision.json"
         output = self.directory / "precision.xlsx"
         self.run_command("plan", "-i", self.source, "-o", output, "--save", saved)

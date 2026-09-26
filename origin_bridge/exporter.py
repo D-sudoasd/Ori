@@ -21,6 +21,7 @@ from openpyxl.styles import Font
 from openpyxl.utils import get_column_letter
 
 from .models import DataColumn, DataImportError, PlannedTable, PreparedImport
+from .dates import parse_iso_datetime
 
 _XLSX_MAX_ROWS = 1_048_576
 _XLSX_MAX_COLUMNS = 16_384
@@ -239,11 +240,8 @@ def _datetime_value(raw: str, table_name: str, column_name: str, row_index: int)
 
 
 def _parse_datetime(raw: str, table_name: str, column_name: str, row_index: int) -> datetime:
-    token = raw.strip()
-    if token.endswith(("Z", "z")):
-        token = token[:-1] + "+00:00"
     try:
-        value = datetime.fromisoformat(token)
+        value = parse_iso_datetime(raw)
     except ValueError as exc:
         raise DataImportError(
             f"Invalid ISO date/time in {table_name}/{column_name}, row {row_index}: {raw!r}"

@@ -153,9 +153,9 @@ def _column_range(column: DataColumn) -> dict[str, str | None]:
         return {"min": str(min(values)), "max": str(max(values))}
     if column.kind == "datetime" and present:
         def utc_key(value: str) -> datetime:
-            normalized = value[:-1] + "+00:00" if value.endswith(("Z", "z")) else value
             try:
-                parsed = datetime.fromisoformat(normalized)
+                from .dates import parse_iso_datetime
+                parsed = parse_iso_datetime(value)
             except ValueError as exc:
                 raise DataImportError(f"Invalid ISO datetime in column {column.name!r}: {value!r}") from exc
             if parsed.tzinfo is None:
