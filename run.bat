@@ -14,6 +14,7 @@ if errorlevel 1 (
 )
 py -3 spectra_to_origin.py %*
 if errorlevel 1 (
-  echo Failed to start. Need Python launcher: py -3
+  echo SpectraToOrigin failed. See the error above.
   pause
+  exit /b 1
 )

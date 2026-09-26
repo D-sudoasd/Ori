@@ -1,7 +1,7 @@
 @echo off
 setlocal
 cd /d "%~dp0"
-py -3 -m pip install -q pyinstaller openpyxl
+py -3 -m pip install -r requirements-build.txt
 if errorlevel 1 (
   echo Failed to install PyInstaller.
   exit /b 1

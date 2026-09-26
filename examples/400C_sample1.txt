@@ -1,0 +1,9 @@
+# Synthetic demonstration data; not an experimental measurement.
+2theta Intensity
+10 5
+11 8
+12 18
+13 40
+14 19
+15 8
+16 5

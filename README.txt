@@ -1,30 +1,26 @@
-谱线 → Origin 工程 (.opju)
-=======================
+SpectraToOrigin 1.1.0
+====================
 
-把多条两列 1D 谱直接写进 Origin Pro：同一张工作表、XYYY 或 XYXY 列类型，并生成曲线图，保存为 .opju。
+把两列 XRD／光谱文件批量导入 Origin：每组一张工作表、一张曲线图。
+也可以不启动 Origin，直接导出全部分组的 Excel 和 CSV。
 
-需要
-----
-本机已安装 Origin Pro（当前机器是 Origin 2025），且当前 Python 能 import originpro。
+1. 双击 run.bat，或运行构建好的 SpectraToOrigin.exe。
+2. 拖入 txt/dat/xy/csv/tsv 文件或文件夹，选中谱线查看预览。
+3. 选择自动布局、分组方式，填写坐标轴名称和单位。
+4. 点击生成 Origin 工程，或只导出 Excel/CSV。
 
-启动
-----
-双击 run.bat（推荐）或 启动.bat
-或：py -3 spectra_to_origin.py
+生成 .opju 需要安装并激活 Origin Pro；先保存并关闭已打开的 Origin。
+表格导出不需要 Origin。多组 CSV 位于“输出名_csv”文件夹，每组一个文件。
+本工具只整理和绘图，不做插值、拟合、平滑或强度归一化。
 
-不要用带中文的 chcp 65001 批处理；脚本目录在「桌面」下时，旧启动文件会把命令拆断。
+源代码运行：
+py -3 -m pip install -r requirements.txt
+py -3 spectra_to_origin.py
 
-用法
-----
-1. 把谱线 txt 或文件夹拖进窗口（也可点添加文件/文件夹）
-2. X 列相同会自动识别为 XYYY；不同则为 XYXY。仍可手动改
-3. 加载后按文件名自动分组（不限于温度）。也可均分成 3/4 张，或把选中项移入某组、改组名
-4. 点「生成 Origin 工程 (.opju)」：每组一张工作表 + 一张线图
+检查演示数据：
+py -3 spectra_to_origin.py --check -i examples --group-by-name
 
-同一文件夹里的「按温度」子目录是副本，添加上级文件夹时会跳过，避免导两遍。
+只导出表格：
+py -3 spectra_to_origin.py --cli --xlsx-only -i examples -o demo.xlsx --n-groups 2
 
-命令行
-----
-py -3 spectra_to_origin.py --cli -i "谱线文件夹" -o "out.opju" --layout XYYY --split-temp
-
-这批 Ti-2448 合成谱 X 网格相同，用 XYYY。不要从峰面积读相分数，不要从峰宽读晶粒。
+详细格式、参数、测试与构建说明请阅读 README.md。
