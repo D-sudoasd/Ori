@@ -1,0 +1,50 @@
+name: Tests
+
+on:
+  push:
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  tests:
+    runs-on: windows-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        python-version: ['3.10', '3.13']
+    env:
+      PYTHONUTF8: '1'
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-python@v7
+        with:
+          python-version: ${{ matrix.python-version }}
+          cache: pip
+      - run: python -m pip install -r requirements.txt
+      - run: python -m unittest discover -v
+
+  windows-build:
+    runs-on: windows-latest
+    env:
+      PYTHONUTF8: '1'
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-python@v7
+        with:
+          python-version: '3.13'
+          cache: pip
+      - run: python -m pip install -r requirements-build.txt
+      - run: python -m PyInstaller --noconfirm --clean SpectraToOrigin.spec
+      - name: Verify packaged table export
+        shell: pwsh
+        run: |
+          $result = Start-Process -FilePath "$PWD\dist\SpectraToOrigin.exe" -ArgumentList '--cli --xlsx-only -i examples -o _test_out\packaged.xlsx --group-by-name' -WindowStyle Hidden -Wait -PassThru
+          if ($result.ExitCode -ne 0) { exit $result.ExitCode }
+          python -c "from openpyxl import load_workbook; from pathlib import Path; b=load_workbook('_test_out/packaged.xlsx'); assert b.sheetnames==['400C','500C','readme']; assert b['400C'].cell(7,3).value==48; assert b['500C'].cell(7,3).value==60; assert len(list(Path('_test_out/packaged_csv').glob('*.csv')))==2; b.close()"
+      - uses: actions/upload-artifact@v7
+        with:
+          name: SpectraToOrigin-Windows
+          path: dist/SpectraToOrigin.exe
+          if-no-files-found: error

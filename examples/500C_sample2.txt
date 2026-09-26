@@ -1,0 +1,9 @@
+# Synthetic demonstration data; not an experimental measurement.
+2theta Intensity
+20.0 5D+0
+21.0 1D+1
+22.0 3D+1
+23.0 6D+1
+24.0 3.1D+1
+25.0 1.1D+1
+26.0 6D+0

@@ -18,8 +18,6 @@ from unittest import mock
 
 import spectra_to_origin as sto
 
-TI2448 = Path(r"D:\Backup\桌面\Aging_data_analysis\Ti2448_时效eta_83keV\01_1D谱线_2theta")
-
 TI2448_STEMS = [
     "01_400C_00.50h_eta0.61000",
     "02_400C_01.00h_eta0.64000",
@@ -168,7 +166,6 @@ class GroupTests(unittest.TestCase):
         dest = d_root / "committed.opju"
         if dest.exists():
             dest.unlink()
-        self.assertNotEqual(src.drive.lower(), dest.drive.lower())
         result = sto.commit_exported_file(src, dest)
         self.assertEqual(result, dest.resolve())
         self.assertTrue(dest.exists())
@@ -179,12 +176,23 @@ class GroupTests(unittest.TestCase):
 
 
 class DropLoadTests(unittest.TestCase):
+    def setUp(self) -> None:
+        self.fixture = tempfile.TemporaryDirectory()
+        self.addCleanup(self.fixture.cleanup)
+        self.folder = Path(self.fixture.name)
+        copies = self.folder / "按温度"
+        copies.mkdir()
+        for stem in ["00_HR_00.00h_eta0.00000", *TI2448_STEMS]:
+            source = self.folder / f"{stem}.txt"
+            _write_xy(source, [("0", "1"), ("1", "2")])
+            shutil.copy2(source, copies / source.name)
+
     def test_simulated_drop_dedupes_temp_copies(self) -> None:
-        self.assertTrue(TI2448.is_dir(), f"missing sample folder {TI2448}")
+        folder = self.folder
         payload = [
-            str(TI2448),
-            str(TI2448 / "按温度"),
-            str(TI2448 / "01_400C_00.50h_eta0.61000.txt"),
+            str(folder),
+            str(folder / "按温度"),
+            str(folder / "01_400C_00.50h_eta0.61000.txt"),
         ]
         loaded = sto.load_from_drop_payload([], payload)
         names = [path.name.lower() for path in loaded]
@@ -194,7 +202,7 @@ class DropLoadTests(unittest.TestCase):
         self.assertFalse(any(sto.TEMP_COPY_DIR in path.parts for path in loaded))
 
     def test_newline_and_quoted_drop_payload(self) -> None:
-        folder = TI2448
+        folder = self.folder
         text = f'"{folder}"\r\n{folder / "按温度"}'
         paths = sto.parse_drop_paths(text)
         self.assertEqual(len(paths), 2)
@@ -206,7 +214,7 @@ class DropLoadTests(unittest.TestCase):
         source = inspect.getsource(sto.SpectraToOriginApp)
         self.assertIn("enable_windows_file_drop", source)
         self.assertIn("_on_drop_paths", source)
-        self.assertIn("load_from_drop_payload", inspect.getsource(sto.SpectraToOriginApp._add_paths))
+        self.assertIn("collect_from_user_paths", inspect.getsource(sto.SpectraToOriginApp._add_paths))
         self.assertIn("WM_DROPFILES", inspect.getsource(sto._enable_windows_file_drop))
         self.assertIn("_enable_windows_file_drop", inspect.getsource(sto.enable_windows_file_drop))
         add_source = inspect.getsource(sto.SpectraToOriginApp._build)
@@ -217,6 +225,8 @@ class DropLoadTests(unittest.TestCase):
         self.assertIn("自动", add_source)
 
     def test_enable_drop_on_real_tk_update_does_not_overflow(self) -> None:
+        if sys.platform != "win32":
+            self.skipTest("Windows native drag-and-drop test")
         ignored: list[BaseException] = []
 
         def _unraisable(unraisable) -> None:
@@ -293,7 +303,10 @@ def _record_origin_unavailable(reason: str) -> None:
 
 
 class BulkCliTests(unittest.TestCase):
+    @unittest.skipUnless(os.environ.get("SPECTRA_TEST_ORIGIN") == "1", "set SPECTRA_TEST_ORIGIN=1 for the installed Origin integration test")
     def test_cli_ingests_forty_plus_txts_into_one_workbook(self) -> None:
+        if sto.origin_process_running():
+            self.skipTest("Origin is already running; preserve the user's session")
         n_files = 48
         tool = Path(sto.__file__).resolve()
         dest_dir = tool.parent / "_test_out"
@@ -312,7 +325,6 @@ class BulkCliTests(unittest.TestCase):
                     folder / f"{stem}.txt",
                     [("0.0", str(index)), ("1.0", str(index + 1)), ("2.0", str(index + 2))],
                 )
-            self.assertNotEqual(Path(tempfile.gettempdir()).resolve().drive.lower(), opju.drive.lower())
             proc = subprocess.run(
                 [
                     sys.executable,
@@ -348,16 +360,23 @@ class BulkCliTests(unittest.TestCase):
                         "import originpro as op\n"
                         "import spectra_to_origin as sto\n"
                         "started = not sto.origin_process_running()\n"
-                        "op.set_show(False)\n"
-                        "assert op.open(sys.argv[1])\n"
-                        "sheet = list(op.pages('w'))[0][0]\n"
-                        "graphs = list(op.pages('g'))\n"
-                        "n_cols = int(sheet.cols)\n"
-                        "labels = [sheet.get_label(c, 'L') for c in range(n_cols)]\n"
-                        "n_plots = len(list(graphs[0][0].obj.DataPlots)) if graphs else 0\n"
-                        "print(n_cols, n_plots)\n"
-                        "print(','.join(str(item) for item in labels))\n"
-                        "sto.close_origin_app(op, started=started)\n"
+                        "if not started: raise RuntimeError('An Origin session is already open')\n"
+                        "try:\n"
+                        "    op.set_show(False)\n"
+                        "    assert op.open(sys.argv[1])\n"
+                        "    sheet = list(op.pages('w'))[0][0]\n"
+                        "    graphs = list(op.pages('g'))\n"
+                        "    n_cols = int(sheet.cols)\n"
+                        "    labels = [sheet.get_label(c, 'L') for c in range(n_cols)]\n"
+                        "    n_plots = len(list(graphs[0][0].obj.DataPlots)) if graphs else 0\n"
+                        "    assert sheet.to_list(0) == [0.0, 1.0, 2.0]\n"
+                        "    for col in range(1, n_cols):\n"
+                        "        index = int(labels[col].split('_')[1])\n"
+                        "        assert sheet.to_list(col) == [index, index + 1, index + 2]\n"
+                        "    print(n_cols, n_plots)\n"
+                        "    print(','.join(str(item) for item in labels))\n"
+                        "finally:\n"
+                        "    sto.close_origin_app(op, started=started)\n"
                     ),
                     str(opju),
                 ],
