@@ -67,7 +67,7 @@ class GuiStatusTests(unittest.TestCase):
 class ParsedCacheTests(unittest.TestCase):
     def test_cache_reloads_when_size_or_mtime_changes(self) -> None:
         with tempfile.TemporaryDirectory() as raw:
-            path = Path(raw) / "sample.txt"
+            path = Path(raw).resolve() / "sample.txt"
             path.write_text("0 1\n1 2\n", encoding="utf-8")
             app = sto.SpectraToOriginApp.__new__(sto.SpectraToOriginApp)
             app.files = [path]
@@ -108,7 +108,7 @@ class ExportWorkerTests(unittest.TestCase):
 
     def test_xlsx_export_runs_in_a_spawned_worker(self) -> None:
         with tempfile.TemporaryDirectory() as raw:
-            folder = Path(raw)
+            folder = Path(raw).resolve()
             source = folder / "sample.txt"
             source.write_text("0 1\n1 2\n2 3\n", encoding="utf-8")
             spectrum = sto.parse_spectrum(source)
@@ -156,7 +156,7 @@ class ExportWorkerTests(unittest.TestCase):
     @unittest.skipUnless(os.environ.get("SPECTRA_TEST_GUI") == "1", "set SPECTRA_TEST_GUI=1 for the Tk integration check")
     def test_real_tk_window_stays_responsive_during_xlsx_export(self) -> None:
         with tempfile.TemporaryDirectory() as raw:
-            folder = Path(raw)
+            folder = Path(raw).resolve()
             files = []
             for file_index in range(3):
                 path = folder / f"scan_{file_index}.txt"

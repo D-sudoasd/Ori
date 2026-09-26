@@ -179,7 +179,7 @@ class DropLoadTests(unittest.TestCase):
     def setUp(self) -> None:
         self.fixture = tempfile.TemporaryDirectory()
         self.addCleanup(self.fixture.cleanup)
-        self.folder = Path(self.fixture.name)
+        self.folder = Path(self.fixture.name).resolve()
         copies = self.folder / "按温度"
         copies.mkdir()
         for stem in ["00_HR_00.00h_eta0.00000", *TI2448_STEMS]:
@@ -260,7 +260,7 @@ class DropLoadTests(unittest.TestCase):
 class FixtureRoundTripTests(unittest.TestCase):
     def test_xlsx_only_same_x_and_diff_x(self) -> None:
         with tempfile.TemporaryDirectory() as raw:
-            root = Path(raw)
+            root = Path(raw).resolve()
             same = root / "same"
             diff = root / "diff"
             same.mkdir()
@@ -315,7 +315,7 @@ class BulkCliTests(unittest.TestCase):
         if opju.exists():
             opju.unlink()
         with tempfile.TemporaryDirectory() as raw:
-            folder = Path(raw) / "spectra"
+            folder = Path(raw).resolve() / "spectra"
             folder.mkdir()
             stems = []
             for index in range(n_files):
@@ -405,7 +405,7 @@ class BulkCliTests(unittest.TestCase):
 
     def test_run_cli_origin_failure_is_visible(self) -> None:
         with tempfile.TemporaryDirectory() as raw:
-            folder = Path(raw)
+            folder = Path(raw).resolve()
             _write_xy(folder / "a.txt", [("0", "1"), ("1", "2")])
             out = folder / "out.opju"
             args = sto.build_parser().parse_args(["--cli", "-i", str(folder), "-o", str(out)])

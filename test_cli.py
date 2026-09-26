@@ -16,7 +16,7 @@ class CliTests(unittest.TestCase):
     def setUp(self):
         temp = tempfile.TemporaryDirectory()
         self.addCleanup(temp.cleanup)
-        self.root = Path(temp.name)
+        self.root = Path(temp.name).resolve()
         self.source = self.root / "input"
         self.source.mkdir()
         (self.source / "sample1.txt").write_text("0 10\n1 11\n", encoding="utf-8")

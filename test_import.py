@@ -18,7 +18,7 @@ class SpectrumParsingTests(unittest.TestCase):
             "semicolon.dat": "x;signal\n0.10;12.5\n0.20;13.5\n",
         }
         with tempfile.TemporaryDirectory() as raw:
-            root = Path(raw)
+            root = Path(raw).resolve()
             for name, text in rows.items():
                 path = root / name
                 path.write_text(text, encoding="utf-8")
@@ -34,7 +34,7 @@ class SpectrumParsingTests(unittest.TestCase):
             ("utf16.xy", "utf-16", "x\ty\n1.2500\t2.5000\n2.2500\t3.5000\n", ("1.2500", "2.2500"), ("2.5000", "3.5000")),
         ]
         with tempfile.TemporaryDirectory() as raw:
-            root = Path(raw)
+            root = Path(raw).resolve()
             for name, encoding, text, x_expected, y_expected in samples:
                 path = root / name
                 path.write_text(text, encoding=encoding)
@@ -45,7 +45,7 @@ class SpectrumParsingTests(unittest.TestCase):
 
     def test_utf16_without_bom_is_not_accepted_as_bom_marked_utf16(self) -> None:
         with tempfile.TemporaryDirectory() as raw:
-            path = Path(raw) / "utf16_no_bom.txt"
+            path = Path(raw).resolve() / "utf16_no_bom.txt"
             path.write_bytes("0\t1\n1\t2\n".encode("utf-16-le"))
             with self.assertRaises(ValueError):
                 sto.parse_spectrum(path)
@@ -53,7 +53,7 @@ class SpectrumParsingTests(unittest.TestCase):
     def test_nonfinite_values_report_filename_and_physical_line(self) -> None:
         values = ["NaN", "-Infinity", "1e999"]
         with tempfile.TemporaryDirectory() as raw:
-            root = Path(raw)
+            root = Path(raw).resolve()
             for value in values:
                 path = root / "bad.txt"
                 path.write_text(f"# comment\n0 1\n1 {value}\n2 3\n", encoding="utf-8")
@@ -63,28 +63,28 @@ class SpectrumParsingTests(unittest.TestCase):
 
     def test_bad_numeric_row_reports_physical_line(self) -> None:
         with tempfile.TemporaryDirectory() as raw:
-            path = Path(raw) / "bad.csv"
+            path = Path(raw).resolve() / "bad.csv"
             path.write_text("x,y\n0,1\n1,noise\n", encoding="utf-8")
             with self.assertRaisesRegex(ValueError, r"bad\.csv 第 3 行不是数值"):
                 sto.parse_spectrum(path)
 
     def test_first_bad_data_row_is_rejected_instead_of_treated_as_a_header(self) -> None:
         with tempfile.TemporaryDirectory() as raw:
-            path = Path(raw) / "bad_first.csv"
+            path = Path(raw).resolve() / "bad_first.csv"
             path.write_text("0,noise\n1,2\n2,3\n", encoding="utf-8")
             with self.assertRaisesRegex(ValueError, r"bad_first\.csv 第 1 行不是数值"):
                 sto.parse_spectrum(path)
 
     def test_text_row_after_numeric_data_is_not_silently_skipped_as_a_header(self) -> None:
         with tempfile.TemporaryDirectory() as raw:
-            path = Path(raw) / "bad_middle.csv"
+            path = Path(raw).resolve() / "bad_middle.csv"
             path.write_text("0,1\n1,2\nnoise,error\n2,3\n", encoding="utf-8")
             with self.assertRaisesRegex(ValueError, r"bad_middle\.csv 第 3 行不是数值"):
                 sto.parse_spectrum(path)
 
     def test_header_values_may_contain_digits_and_csv_fields_may_be_quoted(self) -> None:
         with tempfile.TemporaryDirectory() as raw:
-            path = Path(raw) / "quoted.csv"
+            path = Path(raw).resolve() / "quoted.csv"
             path.write_text(
                 '"2theta, deg","I4000 (a.u.)"\n"0.10","12.5"\n"0.20","13.5"\n',
                 encoding="utf-8",
@@ -95,14 +95,14 @@ class SpectrumParsingTests(unittest.TestCase):
 
     def test_csv_quote_error_reports_filename_and_physical_line(self) -> None:
         with tempfile.TemporaryDirectory() as raw:
-            path = Path(raw) / "bad_quote.csv"
+            path = Path(raw).resolve() / "bad_quote.csv"
             path.write_text('0,1\n1,"2\n2,3\n', encoding="utf-8")
             with self.assertRaisesRegex(ValueError, r"bad_quote\.csv 第 2 行分隔符格式无效"):
                 sto.parse_spectrum(path)
 
     def test_nonfinite_first_row_is_not_mistaken_for_a_header(self) -> None:
         with tempfile.TemporaryDirectory() as raw:
-            path = Path(raw) / "bad.tsv"
+            path = Path(raw).resolve() / "bad.tsv"
             path.write_text("NaN\tInf\n1\t2\n", encoding="utf-8")
             with self.assertRaisesRegex(ValueError, r"bad\.tsv 第 1 行包含非有限数值"):
                 sto.parse_spectrum(path)
@@ -111,7 +111,7 @@ class SpectrumParsingTests(unittest.TestCase):
 class CollectionTests(unittest.TestCase):
     def test_supported_suffixes_are_collected_in_natural_order(self) -> None:
         with tempfile.TemporaryDirectory() as raw:
-            root = Path(raw)
+            root = Path(raw).resolve()
             for name in ("scan10.txt", "scan2.csv", "scan1.xy", "ignore.pdf", "scan3.tsv", "scan4.dat"):
                 (root / name).write_text("0 1\n1 2\n", encoding="utf-8")
             result = sto.collect_txt_files(root)
@@ -122,7 +122,7 @@ class CollectionTests(unittest.TestCase):
 
     def test_recursive_collection_sorts_naturally_and_includes_temp_copy_for_comparison(self) -> None:
         with tempfile.TemporaryDirectory() as raw:
-            root = Path(raw)
+            root = Path(raw).resolve()
             (root / "scan10.txt").write_text("0 10\n1 11\n", encoding="utf-8")
             (root / "scan2.txt").write_text("0 2\n1 3\n", encoding="utf-8")
             temp_copy = root / sto.TEMP_COPY_DIR
@@ -136,7 +136,7 @@ class CollectionTests(unittest.TestCase):
 
     def test_merge_keeps_distinct_same_name_files_and_only_removes_real_temp_copy(self) -> None:
         with tempfile.TemporaryDirectory() as raw:
-            root = Path(raw)
+            root = Path(raw).resolve()
             first = root / "series-a" / "scan.txt"
             second = root / "series-b" / "scan.txt"
             original = root / "scan.txt"
@@ -156,7 +156,7 @@ class CollectionTests(unittest.TestCase):
 
     def test_same_name_regular_files_are_retained_even_when_bytes_match(self) -> None:
         with tempfile.TemporaryDirectory() as raw:
-            root = Path(raw)
+            root = Path(raw).resolve()
             first = root / "one" / "same.txt"
             second = root / "two" / "same.txt"
             first.parent.mkdir()
@@ -167,7 +167,7 @@ class CollectionTests(unittest.TestCase):
 
     def test_same_bytes_in_unrelated_trees_are_not_treated_as_temp_copies(self) -> None:
         with tempfile.TemporaryDirectory() as raw:
-            root = Path(raw)
+            root = Path(raw).resolve()
             temp_named = root / "experiment-a" / sto.TEMP_COPY_DIR / "scan.txt"
             independent = root / "experiment-b" / "scan.txt"
             temp_named.parent.mkdir(parents=True)
@@ -181,7 +181,7 @@ class CollectionTests(unittest.TestCase):
 
     def test_exact_sibling_temp_copy_is_deduplicated_and_prefers_primary(self) -> None:
         with tempfile.TemporaryDirectory() as raw:
-            root = Path(raw)
+            root = Path(raw).resolve()
             primary = root / "scan.txt"
             copy = root / sto.TEMP_COPY_DIR / "scan.txt"
             copy.parent.mkdir()
@@ -191,7 +191,7 @@ class CollectionTests(unittest.TestCase):
 
     def test_user_path_collection_returns_invalid_inputs_as_errors(self) -> None:
         with tempfile.TemporaryDirectory() as raw:
-            root = Path(raw)
+            root = Path(raw).resolve()
             valid = root / "valid.csv"
             invalid = root / "missing.txt"
             valid.write_text("0,1\n1,2\n", encoding="utf-8")

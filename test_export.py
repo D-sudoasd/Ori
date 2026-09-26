@@ -121,7 +121,7 @@ class ExportIntegrityTests(unittest.TestCase):
 
     def test_auto_layout_is_inferred_independently_for_each_group(self) -> None:
         with tempfile.TemporaryDirectory() as raw:
-            root = Path(raw)
+            root = Path(raw).resolve()
             files = [
                 _write_spectrum(root / "same_a.txt", [("1", "2"), ("2", "3")]),
                 _write_spectrum(root / "same_b.txt", [("1.0", "4"), ("2.0", "5")]),
@@ -137,7 +137,7 @@ class ExportIntegrityTests(unittest.TestCase):
 
     def test_explicit_xyyy_mismatch_fails_before_origin_or_output(self) -> None:
         with tempfile.TemporaryDirectory() as raw:
-            root = Path(raw)
+            root = Path(raw).resolve()
             a = _write_spectrum(root / "a.txt", [("1", "2"), ("2", "3")])
             b = _write_spectrum(root / "b.txt", [("10", "4"), ("20", "5")])
             output = root / "out.opju"
@@ -152,7 +152,7 @@ class ExportIntegrityTests(unittest.TestCase):
 
     def test_group_exports_round_trip_to_xlsx_and_every_csv_with_safe_names(self) -> None:
         with tempfile.TemporaryDirectory() as raw:
-            root = Path(raw)
+            root = Path(raw).resolve()
             a = _write_spectrum(root / "a.txt", [("1", "2"), ("2", "3")])
             b = _write_spectrum(root / "b.txt", [("10", "4"), ("20", "5")])
             spectra = sto.parse_spectra([a, b])
@@ -184,7 +184,7 @@ class ExportIntegrityTests(unittest.TestCase):
 
     def test_metadata_that_looks_like_formula_is_stored_as_text(self) -> None:
         with tempfile.TemporaryDirectory() as raw:
-            root = Path(raw)
+            root = Path(raw).resolve()
             source = _write_spectrum(root / "formula.txt", [("1", "2"), ("2", "3")])
             spectrum = sto.Spectrum(source, ("1", "2"), ("2", "3"), "=2+2", "=1+1", None)
             xlsx, _csv = sto.export_spectra(
@@ -200,7 +200,7 @@ class ExportIntegrityTests(unittest.TestCase):
 
     def test_xlsx_csv_collision_with_input_fails_before_writing(self) -> None:
         with tempfile.TemporaryDirectory() as raw:
-            root = Path(raw)
+            root = Path(raw).resolve()
             input_csv = _write_spectrum(root / "out.csv", [("1", "2"), ("2", "3")])
             xlsx = root / "out.xlsx"
             before = input_csv.read_bytes()
@@ -211,7 +211,7 @@ class ExportIntegrityTests(unittest.TestCase):
 
     def test_csv_save_dialog_suffix_produces_distinct_xlsx_and_csv(self) -> None:
         with tempfile.TemporaryDirectory() as raw:
-            root = Path(raw)
+            root = Path(raw).resolve()
             source = _write_spectrum(root / "scan.txt", [("1", "2"), ("2", "3")])
             xlsx, csv_path = sto.export_spectra([source], root / "result.csv")
             self.assertEqual(xlsx, root / "result.xlsx")
@@ -224,7 +224,7 @@ class ExportIntegrityTests(unittest.TestCase):
 
     def test_failed_xlsx_write_keeps_previous_file_and_cleans_temporary_file(self) -> None:
         with tempfile.TemporaryDirectory() as raw:
-            root = Path(raw)
+            root = Path(raw).resolve()
             source = _write_spectrum(root / "a.txt", [("1", "2"), ("2", "3")])
             output = root / "out.xlsx"
             output.write_bytes(b"old-workbook")
@@ -236,7 +236,7 @@ class ExportIntegrityTests(unittest.TestCase):
 
     def test_failed_csv_write_keeps_previous_sidecar(self) -> None:
         with tempfile.TemporaryDirectory() as raw:
-            root = Path(raw)
+            root = Path(raw).resolve()
             source = _write_spectrum(root / "a.txt", [("1", "2"), ("2", "3")])
             xlsx = root / "out.xlsx"
             csv_path = root / "out.csv"
@@ -250,7 +250,7 @@ class ExportIntegrityTests(unittest.TestCase):
 
     def test_multi_csv_replace_removes_old_groups_and_refuses_user_files(self) -> None:
         with tempfile.TemporaryDirectory() as raw:
-            root = Path(raw)
+            root = Path(raw).resolve()
             sources = [
                 _write_spectrum(root / "a.txt", [("1", "2"), ("2", "3")]),
                 _write_spectrum(root / "b.txt", [("3", "4"), ("4", "5")]),
@@ -275,7 +275,7 @@ class ExportIntegrityTests(unittest.TestCase):
 
     def test_multi_csv_directory_may_not_contain_any_input(self) -> None:
         with tempfile.TemporaryDirectory() as raw:
-            root = Path(raw)
+            root = Path(raw).resolve()
             target = root / "series_csv"
             target.mkdir()
             source = _write_spectrum(target / "not-a-group.csv", [("1", "2"), ("2", "3")])
@@ -292,7 +292,7 @@ class ExportIntegrityTests(unittest.TestCase):
 
     def test_failed_multi_csv_install_restores_previous_directory(self) -> None:
         with tempfile.TemporaryDirectory() as raw:
-            root = Path(raw)
+            root = Path(raw).resolve()
             sources = [
                 _write_spectrum(root / "a.txt", [("1", "2"), ("2", "3")]),
                 _write_spectrum(root / "b.txt", [("3", "4"), ("4", "5")]),
@@ -320,7 +320,7 @@ class ExportIntegrityTests(unittest.TestCase):
 
     def test_failed_multi_csv_rollback_preserves_backup_and_reports_path(self) -> None:
         with tempfile.TemporaryDirectory() as raw:
-            root = Path(raw)
+            root = Path(raw).resolve()
             sources = [
                 _write_spectrum(root / "a.txt", [("1", "2"), ("2", "3")]),
                 _write_spectrum(root / "b.txt", [("3", "4"), ("4", "5")]),
@@ -357,7 +357,7 @@ class ExportIntegrityTests(unittest.TestCase):
 
     def test_user_file_added_while_staging_is_preserved(self) -> None:
         with tempfile.TemporaryDirectory() as raw:
-            root = Path(raw)
+            root = Path(raw).resolve()
             sources = [
                 _write_spectrum(root / "a.txt", [("1", "2"), ("2", "3")]),
                 _write_spectrum(root / "b.txt", [("3", "4"), ("4", "5")]),
@@ -392,7 +392,7 @@ class ExportIntegrityTests(unittest.TestCase):
 
     def test_origin_running_is_refused_before_binding_or_file_write(self) -> None:
         with tempfile.TemporaryDirectory() as raw:
-            root = Path(raw)
+            root = Path(raw).resolve()
             source = _write_spectrum(root / "a.txt", [("1", "2"), ("2", "3")])
             spectrum = sto.parse_spectrum(source)
             target = root / "out.opju"
@@ -406,7 +406,7 @@ class ExportIntegrityTests(unittest.TestCase):
 
     def test_fake_origin_save_failure_preserves_old_opju_and_closes_session(self) -> None:
         with tempfile.TemporaryDirectory() as raw:
-            root = Path(raw)
+            root = Path(raw).resolve()
             source = _write_spectrum(root / "a.txt", [("1", "2"), ("2", "3")])
             spectrum = sto.parse_spectrum(source)
             target = root / "out.opju"
@@ -428,7 +428,7 @@ class ExportIntegrityTests(unittest.TestCase):
 
     def test_fake_origin_success_replaces_old_opju_atomically(self) -> None:
         with tempfile.TemporaryDirectory() as raw:
-            root = Path(raw)
+            root = Path(raw).resolve()
             source = _write_spectrum(root / "a.txt", [("1", "2"), ("2", "3")])
             spectrum = sto.parse_spectrum(source)
             target = root / "out.opju"
@@ -449,7 +449,7 @@ class ExportIntegrityTests(unittest.TestCase):
 
     def test_locked_origin_temp_source_does_not_report_failure_and_is_cleaned_after_exit(self) -> None:
         with tempfile.TemporaryDirectory() as raw:
-            root = Path(raw)
+            root = Path(raw).resolve()
             source = _write_spectrum(root / "a.txt", [("1", "2"), ("2", "3")])
             spectrum = sto.parse_spectrum(source)
             target = root / "out.opju"
@@ -479,7 +479,7 @@ class ExportIntegrityTests(unittest.TestCase):
 
     def test_keep_open_switches_to_final_project_path(self) -> None:
         with tempfile.TemporaryDirectory() as raw:
-            root = Path(raw)
+            root = Path(raw).resolve()
             source = _write_spectrum(root / "a.txt", [("1", "2"), ("2", "3")])
             spectrum = sto.parse_spectrum(source)
             target = root / "out.opju"
@@ -497,7 +497,7 @@ class ExportIntegrityTests(unittest.TestCase):
 
     def test_excel_dimension_limit_is_checked_before_creating_output(self) -> None:
         with tempfile.TemporaryDirectory() as raw:
-            root = Path(raw)
+            root = Path(raw).resolve()
             source = _write_spectrum(root / "a.txt", [("1", "2"), ("2", "3")])
             target = root / "too_many_rows.xlsx"
             with mock.patch.object(sto, "EXCEL_MAX_ROWS", 4):

@@ -17,7 +17,7 @@ class OriginGroupRoundTripTests(unittest.TestCase):
         if sto.origin_process_running():
             self.skipTest("Origin is already running; preserve the user's session")
         with tempfile.TemporaryDirectory() as raw:
-            folder = Path(raw)
+            folder = Path(raw).resolve()
             source = folder / "input"
             source.mkdir()
             (source / "400C_sample1.csv").write_text("x,y\n0,10\n1,11\n2,12\n", encoding="utf-8")
