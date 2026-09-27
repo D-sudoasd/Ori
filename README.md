@@ -1,4 +1,4 @@
-# Data to Origin
+# Ori
 
 把常见的实验、监测和工程表格导入 Origin，生成可继续编辑的 `.opju` 工程，也可以只生成 Excel。项目现已支持多列表格、Excel 多工作表和扁平 JSON 数据；原有的 XRD／光谱批量分组流程仍可使用。
 

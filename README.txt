@@ -1,5 +1,5 @@
-Data to Origin
-==============
+Ori
+===
 
 把常见的表格数据导入 Origin Pro，生成 .opju 工程；也可只导出 Excel。
 源码新版默认打开通用数据窗口，可处理多列表格和 Excel 多工作表。
