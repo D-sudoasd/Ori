@@ -1,4 +1,49 @@
+<p align="center">
+  <img src="assets/readme/hero.png" width="100%" alt="Ori — Import research tables into editable Origin projects / 将科研表格导入可编辑的 Origin 工程. Conceptual illustration / 概念插图。">
+</p>
+
 # Ori
+
+**Import research tables into editable Origin projects**
+
+**将科研表格导入可编辑的 Origin 工程**
+
+[Overview / 项目概览](#overview--项目概览) · [Start / 开始使用](#start--开始使用) · [Reference / 详细说明](#reference--详细说明)
+
+## Overview / 项目概览
+
+Ori imports text tables, Excel worksheets and flat JSON data into Origin projects or Excel workbooks. Inspect column types, review an import plan and retain source information with the exported tables.
+
+Ori 将文本表格、Excel 工作表和扁平 JSON 数据导入 Origin 工程或 Excel 工作簿。先检查列类型和导入计划，再将来源信息与数据表一起导出。
+
+- **Typed tables** — 支持数值、文本、日期时间和缺失值。
+- **Editable project output** — 映射 X/Y 和误差列，生成可继续编辑的 OPJU 工程。
+- **GUI, CLI and optional MCP** — 图形界面与结构化命令共用检查、计划、验证和执行流程。
+
+## Start / 开始使用
+
+From the checkout, install dependencies and launch the desktop tool. See [Agent guide / Agent 指南](docs/agent-guide.md) and [Example tables / 示例表格](examples_general).
+
+在仓库目录安装并启动：
+
+```powershell
+py -3 -m pip install -r requirements.txt
+py -3 spectra_to_origin.py
+```
+
+For read-only inspection / 只读检查：
+
+```powershell
+py -3 -m origin_bridge inspect -i ./examples_general
+```
+
+OPJU requires Windows and a working OriginPro installation. XLSX export does not require Origin and creates data tables, not graphs. Existing Origin sessions are protected.
+
+OPJU 导出需要 Windows 与可用的 OriginPro；XLSX 导出不依赖 Origin，只生成数据表。程序保护已有 Origin 会话。
+
+*Cover: AI-generated conceptual illustration. 封面为 AI 生成的概念插图。*
+
+## Reference / 详细说明
 
 把常见的实验、监测和工程表格导入 Origin，生成可继续编辑的 `.opju` 工程，也可以只生成 Excel。项目现已支持多列表格、Excel 多工作表和扁平 JSON 数据；原有的 XRD／光谱批量分组流程仍可使用。
 
