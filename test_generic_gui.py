@@ -352,5 +352,400 @@ class GenericGuiContractTests(unittest.TestCase):
                 app.root.destroy()
 
 
+class _Var:
+    def __init__(self, value=""):
+        self.value = value
+
+    def set(self, value):
+        self.value = value
+
+    def get(self):
+        return self.value
+
+
+class _Pipe:
+    def __init__(self, messages):
+        self.messages = list(messages)
+        self.batch = 0
+        self.max_batch = 0
+        self.recv_count = 0
+
+    def poll(self, _timeout=0):
+        return bool(self.messages)
+
+    def recv(self):
+        if not self.messages:
+            raise EOFError
+        self.batch += 1
+        self.recv_count += 1
+        return self.messages.pop(0)
+
+    def close(self):
+        self.messages.clear()
+
+    def note_batch(self):
+        self.max_batch = max(self.max_batch, self.batch)
+        self.batch = 0
+
+
+class _Process:
+    def __init__(self, alive=True, exit_code=0):
+        self.alive = alive
+        self.exitcode = exit_code
+        self.closed = False
+
+    def is_alive(self):
+        return self.alive
+
+    def join(self, timeout=None):
+        self.alive = False
+
+    def close(self):
+        self.closed = True
+
+
+def _contains_data_table(value):
+    from origin_bridge.models import DataTable
+
+    if isinstance(value, DataTable):
+        return True
+    if isinstance(value, dict):
+        return any(_contains_data_table(item) for item in value.values())
+    if isinstance(value, (list, tuple)):
+        return any(_contains_data_table(item) for item in value)
+    return False
+
+
+class SummaryStoreTests(unittest.TestCase):
+    def _options(self, header="自动", skip="0", delimiter="自动识别"):
+        return _read_options(header, skip, delimiter)
+
+    def test_incremental_reads_ignore_size_and_mtime_and_keep_going_after_a_bad_source(self):
+        from origin_bridge import planning as planning_module
+        from origin_bridge.source_summary import SummaryStore
+
+        with tempfile.TemporaryDirectory() as raw:
+            folder = Path(raw)
+            first = folder / "first.csv"
+            second = folder / "second.csv"
+            changed = folder / "changed.csv"
+            bad = folder / "bad.csv"
+            wide = folder / "wide.csv"
+            payload_a = b"a,b\n1,2\n"
+            payload_b = b"a,b\n3,4\n"
+            self.assertEqual(len(payload_a), len(payload_b))
+            first.write_bytes(b"a,b\n1,2\n")
+            second.write_bytes(b"a,b\n5,6\n")
+            changed.write_bytes(payload_a)
+            bad.write_bytes(b"")
+            wide.write_text("x,y\n" + "\n".join(f"{index},{index}" for index in range(30)) + "\n", encoding="utf-8")
+            stamp = 1_700_000_000
+            os.utime(changed, (stamp, stamp))
+            options = self._options()
+            calls = []
+            real_inspect = planning_module.inspect_inputs
+
+            def spy(paths, options=None):
+                calls.append([Path(path) for path in paths])
+                return real_inspect(paths, options=options)
+
+            store = SummaryStore()
+            with mock.patch.object(planning_module, "inspect_inputs", side_effect=spy):
+                first_result = store.inspect_path(first, options)
+                second_result = store.inspect_path(second, options)
+                bad_result = store.inspect_path(bad, options)
+                wide_result = store.inspect_path(wide, options)
+                changed_first = store.inspect_path(changed, options)
+                misses = store.inspect_calls
+                again = store.inspect_path(first, options)
+                self.assertEqual(store.inspect_calls, misses)
+                size_before = changed.stat().st_size
+                mtime_before = changed.stat().st_mtime
+                changed.write_bytes(payload_b)
+                os.utime(changed, (stamp, stamp))
+                self.assertEqual(changed.stat().st_size, size_before)
+                self.assertEqual(changed.stat().st_mtime, mtime_before)
+                rewritten = store.inspect_path(changed, options)
+                reread = store.inspect_path(changed, options)
+                shifted = store.inspect_path(first, self._options(header="无标题行"))
+
+            self.assertTrue(all(len(batch) == 1 for batch in calls))
+            self.assertTrue(first_result["ok"] and second_result["ok"] and wide_result["ok"] and changed_first["ok"])
+            self.assertEqual(changed_first["tables"][0]["columns"][0]["sample"][0], "1")
+            self.assertFalse(bad_result["ok"])
+            self.assertIn("空", bad_result["error"])
+            self.assertTrue(again["reused"])
+            self.assertEqual(store.cache_hits, 2)
+            self.assertFalse(rewritten["reused"])
+            self.assertEqual(rewritten["tables"][0]["columns"][0]["sample"][0], "3")
+            self.assertTrue(reread["reused"])
+            self.assertEqual(store.inspect_calls, misses + 2)
+            self.assertEqual([column["name"] for column in shifted["tables"][0]["columns"]], ["Column 1", "Column 2"])
+            self.assertFalse(shifted["reused"])
+            self.assertEqual(wide_result["tables"][0]["n_rows"], 30)
+            self.assertLessEqual(len(wide_result["tables"][0]["columns"][0]["sample"]), 5)
+            self.assertNotIn("values", wide_result["tables"][0]["columns"][0])
+            self.assertFalse(_contains_data_table(wide_result))
+            self.assertFalse(_contains_data_table(store._slots))
+
+
+class ImportPollBudgetTests(unittest.TestCase):
+    def _app(self):
+        from origin_bridge.gui import GeneralDataApp
+
+        app = GeneralDataApp.__new__(GeneralDataApp)
+        app.status_var = _Var()
+        app._busy = True
+        app._import_messages = []
+        app._import_result = None
+        app._import_exit_waits = 0
+        app._import_eof = False
+        app._set_busy = lambda busy: setattr(app, "_busy", busy)
+        app.root = types.SimpleNamespace(after=lambda *_args, **_kwargs: None)
+        return app
+
+    def test_progress_stream_is_bounded_per_poll_and_final_result_is_kept(self):
+        from origin_bridge import gui
+
+        app = self._app()
+        messages = [{"type": "progress", "text": f"step {index}"} for index in range(100)]
+        messages.append({"type": "result", "result": {"ok": True, "output": {"path": "out.xlsx", "size_bytes": 12}, "warnings": []}})
+        pipe = _Pipe(messages)
+        process = _Process(alive=True)
+        app._import_recv = pipe
+        app._import_process = process
+        with mock.patch.object(gui.messagebox, "showinfo") as showinfo, mock.patch.object(gui.messagebox, "showerror") as showerror:
+            while pipe.messages and process.alive:
+                app._poll_import()
+                pipe.note_batch()
+                self.assertLessEqual(pipe.max_batch, 20)
+            self.assertEqual(pipe.recv_count, 101)
+            self.assertEqual(app._import_messages, [])
+            self.assertTrue(app._import_result["ok"])
+            showinfo.assert_not_called()
+            process.alive = False
+            app._poll_import()
+            showerror.assert_not_called()
+            showinfo.assert_called_once()
+        self.assertFalse(app._busy)
+        self.assertIn("out.xlsx", app.status_var.get())
+
+    def test_missing_result_after_process_exit_reports_the_exit_code(self):
+        from origin_bridge import gui
+
+        app = self._app()
+        app._import_recv = _Pipe([])
+        app._import_process = _Process(alive=False, exit_code=3)
+        with mock.patch.object(gui.messagebox, "showerror") as showerror, mock.patch.object(gui.messagebox, "showinfo") as showinfo:
+            for _ in range(5):
+                if not app._busy:
+                    break
+                app._poll_import()
+            showinfo.assert_not_called()
+            showerror.assert_called_once()
+            self.assertIn("3", showerror.call_args.args[1])
+        self.assertFalse(app._busy)
+        self.assertEqual(app._import_messages, [])
+
+
+def _pump(app, seconds: float) -> None:
+    deadline = time.monotonic() + seconds
+    while app._busy and time.monotonic() < deadline:
+        app.root.update()
+        time.sleep(0.005)
+    app.root.update()
+
+
+class RealTkSourcePerformanceTests(unittest.TestCase):
+    @unittest.skipUnless(os.environ.get("SPECTRA_TEST_GUI") == "1", "set SPECTRA_TEST_GUI=1 for the Tk and spawn-export integration check")
+    def test_real_tk_reuses_summaries_and_keeps_going_after_one_bad_source(self):
+        from origin_bridge import gui
+        from origin_bridge.gui import GeneralDataApp
+
+        with tempfile.TemporaryDirectory() as raw:
+            folder = Path(raw)
+            good = folder / "signal.csv"
+            other = folder / "other.csv"
+            extra = folder / "extra.csv"
+            bad = folder / "bad.csv"
+            payload_a = b"Time,Signal\n0,1\n"
+            payload_b = b"Time,Signal\n9,8\n"
+            self.assertEqual(len(payload_a), len(payload_b))
+            good.write_bytes(payload_a)
+            other.write_bytes(b"Time,Signal\n2,3\n")
+            extra.write_bytes(b"Time,Signal\n4,5\n")
+            os.utime(good, (1_700_000_000, 1_700_000_000))
+            try:
+                app = GeneralDataApp()
+            except tk.TclError as exc:
+                self.skipTest(f"Tk display is unavailable: {exc}")
+            try:
+                app.root.withdraw()
+                with mock.patch.object(gui.messagebox, "showerror") as showerror:
+                    app._add_paths([folder / "missing.csv"])
+                    _pump(app, 10)
+                    self.assertFalse(app._busy)
+                    showerror.assert_called()
+                self.assertEqual(app._paths, [])
+                self.assertEqual(str(app.export_button.cget("state")), "normal")
+
+                app._add_paths([good])
+                _pump(app, 15)
+                self.assertFalse(app._busy, "first source inspect did not finish")
+                self.assertEqual(app._summaries.inspect_calls, 1)
+                self.assertEqual(app._tables[0]["columns"][1]["sample"], ["1"])
+                app.title_var.set("KEEP ME")
+                app._save_current_plot()
+
+                app._add_paths([other])
+                _pump(app, 15)
+                self.assertEqual(app._summaries.inspect_calls, 2)
+                self.assertEqual(len(app._tables), 2)
+
+                hits = app._summaries.cache_hits
+                app.reload_inputs()
+                _pump(app, 15)
+                self.assertEqual(app._summaries.inspect_calls, 2)
+                self.assertGreaterEqual(app._summaries.cache_hits, hits + 2)
+                self.assertEqual(app.title_var.get(), "KEEP ME")
+
+                mtime = good.stat().st_mtime
+                size = good.stat().st_size
+                good.write_bytes(payload_b)
+                os.utime(good, (1_700_000_000, 1_700_000_000))
+                self.assertEqual(good.stat().st_size, size)
+                self.assertEqual(good.stat().st_mtime, mtime)
+                app.reload_inputs()
+                _pump(app, 15)
+                self.assertEqual(app._summaries.inspect_calls, 3)
+                self.assertEqual(app._tables[0]["columns"][1]["sample"], ["8"])
+                self.assertNotEqual(app.title_var.get(), "KEEP ME")
+
+                app.title_var.set("KEEP HEADER")
+                app._save_current_plot()
+                app.header_var.set("无标题行")
+                app.reload_inputs()
+                _pump(app, 15)
+                self.assertGreaterEqual(app._summaries.inspect_calls, 5)
+                names = [column["name"] for column in app._tables[0]["columns"]]
+                self.assertEqual(names, ["Column 1", "Column 2"])
+                self.assertNotEqual(app.title_var.get(), "KEEP HEADER")
+
+                bad.write_bytes(b"")
+                app.header_var.set("自动")
+                app._add_paths([bad, extra])
+                _pump(app, 15)
+                self.assertFalse(app._busy)
+                values = [app.table_tree.item(iid, "values") for iid in app.table_tree.get_children()]
+                bad_rows = [row for row in values if Path(row[0]).name == "bad.csv"]
+                extra_rows = [row for row in values if Path(row[0]).name == "extra.csv"]
+                self.assertTrue(bad_rows and "错误" in bad_rows[0][2] and bad_rows[0][4])
+                self.assertTrue(extra_rows and extra_rows[0][4] == "就绪")
+                self.assertTrue(any(table["source"]["path"].endswith("extra.csv") for table in app._tables))
+                self.assertFalse(any(table["source"]["path"].endswith("bad.csv") for table in app._tables))
+                with self.assertRaisesRegex(ValueError, "不完整"):
+                    app._effective_plan(folder / "blocked.xlsx", "xlsx", False)
+                self.assertEqual(str(app.export_button.cget("state")), "normal")
+                print(
+                    "MEASURE incremental "
+                    f"inspect_calls={app._summaries.inspect_calls} "
+                    f"cache_hits={app._summaries.cache_hits} "
+                    f"cache_misses={app._summaries.cache_misses}"
+                )
+            finally:
+                thread = getattr(app, "_thread", None)
+                if thread is not None and thread.is_alive():
+                    thread.join(timeout=3)
+                try:
+                    app.root.destroy()
+                except tk.TclError:
+                    pass
+
+    @unittest.skipUnless(os.environ.get("SPECTRA_TEST_GUI") == "1", "set SPECTRA_TEST_GUI=1 for the Tk and spawn-export integration check")
+    def test_real_tk_background_scan_and_chunked_refresh_stay_responsive_for_1000_sources(self):
+        from origin_bridge import gui
+        from origin_bridge.gui import GeneralDataApp
+        from origin_bridge.readers import discover_files
+
+        with tempfile.TemporaryDirectory() as raw:
+            folder = Path(raw) / "sources"
+            folder.mkdir()
+            for index in range(1000):
+                (folder / f"sample{index}.csv").write_text("x,y\n1,2\n", encoding="utf-8")
+            (folder / "notes.md").write_text("ignore", encoding="utf-8")
+            try:
+                app = GeneralDataApp()
+            except tk.TclError as exc:
+                self.skipTest(f"Tk display is unavailable: {exc}")
+            samples = []
+            after_ids: list[str] = []
+
+            def heartbeat():
+                samples.append((time.monotonic(), len(app.table_tree.get_children())))
+                if app._busy:
+                    after_ids.append(app.root.after(10, heartbeat))
+
+            try:
+                app.root.withdraw()
+                warmup = time.monotonic() + 0.5
+                while time.monotonic() < warmup:
+                    app.root.update()
+                    time.sleep(0.01)
+                after_ids.append(app.root.after(10, heartbeat))
+                with (
+                    mock.patch.object(gui.messagebox, "showwarning") as showwarning,
+                    mock.patch.object(gui.messagebox, "showerror") as showerror,
+                    mock.patch.object(gui.messagebox, "showinfo"),
+                ):
+                    app._add_paths([folder, folder / "notes.md"])
+                    self.assertTrue(app._busy)
+                    self.assertLess(len(app.table_tree.get_children()), 1000)
+                    app._on_close()
+                    self.assertTrue(app.root.winfo_exists())
+                    deadline = time.monotonic() + 180
+                    while app._busy and time.monotonic() < deadline:
+                        app.root.update()
+                        time.sleep(0.005)
+                    app.root.update()
+                    self.assertFalse(app._busy, "1000-source inspect did not finish")
+                    showerror.assert_not_called()
+                    showwarning.assert_called()
+                names = [Path(app.table_tree.item(iid, "values")[0]).name for iid in app.table_tree.get_children()]
+                self.assertEqual(names, [path.name for path in discover_files([folder])])
+                self.assertEqual(len(names), 1000)
+                self.assertEqual(app._summaries.inspect_calls, 1000)
+                gaps = [samples[index][0] - samples[index - 1][0] for index in range(1, len(samples))]
+                jumps = [samples[index][1] - samples[index - 1][1] for index in range(1, len(samples))]
+                max_gap = max(gaps) if gaps else 999
+                max_jump = max(jumps) if jumps else 1000
+                partial = any(0 < count < 1000 for _stamp, count in samples)
+                print(
+                    "MEASURE tk1000 "
+                    f"heartbeat_max_gap_s={max_gap:.4f} "
+                    f"max_row_jump={max_jump} "
+                    f"heartbeats={len(samples)} "
+                    f"inspect_calls={app._summaries.inspect_calls} "
+                    f"cache_hits={app._summaries.cache_hits}"
+                )
+                self.assertGreaterEqual(len(samples), 5)
+                self.assertTrue(partial, "tree jumped to the full source list between heartbeats")
+                self.assertLess(max_jump, 80, f"one heartbeat observed {max_jump} new rows")
+                self.assertLess(max_gap, 0.25, f"Tk heartbeat stalled for {max_gap:.3f}s")
+                self.assertEqual(str(app.export_button.cget("state")), "normal")
+            finally:
+                for after_id in after_ids:
+                    try:
+                        app.root.after_cancel(after_id)
+                    except tk.TclError:
+                        pass
+                thread = getattr(app, "_thread", None)
+                if thread is not None and thread.is_alive():
+                    thread.join(timeout=3)
+                try:
+                    app.root.destroy()
+                except tk.TclError:
+                    pass
+
+
 if __name__ == "__main__":
     unittest.main()

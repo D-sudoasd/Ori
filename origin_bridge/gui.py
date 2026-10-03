@@ -10,13 +10,15 @@ import queue
 import subprocess
 import sys
 import threading
+import time
+from collections import deque
 from pathlib import Path
 from tkinter import filedialog, messagebox, ttk
 import tkinter as tk
 from typing import Any
 
-from . import planning
-from .readers import SUPPORTED_EXTENSIONS, discover_files
+from .readers import SUPPORTED_EXTENSIONS, _natural_key, discover_files
+from .source_summary import SummaryStore, options_fingerprint
 from .worker import import_worker
 
 
@@ -24,6 +26,13 @@ SUPPORTED_SUFFIXES = SUPPORTED_EXTENSIONS
 PLAN_SCHEMA_VERSION = 1
 _FORMAT_SUFFIX = {"opju": ".opju", "xlsx": ".xlsx"}
 _DELIMITER_OPTIONS = ("自动识别", "逗号 ,", "制表符 \\t", "分号 ;", "空白分隔")
+# Main-thread budgets. Folder discovery and per-source inspect run off this thread.
+_UI_FRAME_SECONDS = 0.012
+_UI_ROW_BUDGET = 20
+_UI_MESSAGE_BUDGET = 20
+_IMPORT_MESSAGE_BUDGET = 8
+_IMPORT_FRAME_SECONDS = 0.012
+_IMPORT_EXIT_POLLS = 2
 
 
 def _normalized_path(path: str | Path) -> str:
@@ -73,6 +82,44 @@ def _read_options(header: str, skip_rows: str | int, delimiter: str) -> dict[str
     }
 
 
+def _iter_supported_files(root: Path) -> list[Path]:
+    """List supported files under a folder, yielding the GIL between directory reads."""
+    found: list[Path] = []
+    stack = [root]
+    seen_dirs: set[str] = set()
+    visited = 0
+    while stack:
+        current = stack.pop()
+        try:
+            dir_key = _normalized_path(current)
+        except OSError:
+            continue
+        if dir_key in seen_dirs:
+            continue
+        seen_dirs.add(dir_key)
+        try:
+            children = list(os.scandir(current))
+        except OSError:
+            continue
+        visited += 1
+        if visited % 20 == 0:
+            time.sleep(0)
+        for entry in children:
+            try:
+                if entry.is_dir(follow_symlinks=False):
+                    stack.append(Path(entry.path))
+                elif entry.is_file(follow_symlinks=False) and Path(entry.path).suffix.casefold() in SUPPORTED_SUFFIXES:
+                    found.append(Path(entry.path).resolve())
+            except OSError:
+                continue
+    if not found:
+        raise ValueError(f"目录中没有可导入的数据文件：{root}")
+    unique: dict[Path, None] = {}
+    for path in found:
+        unique[path] = None
+    return sorted(unique, key=_natural_key)
+
+
 def _collect_supported(paths: list[str | Path]) -> tuple[list[Path], list[str]]:
     """Expand dropped folders, filter supported data files, and deduplicate."""
     found: list[Path] = []
@@ -86,7 +133,10 @@ def _collect_supported(paths: list[str | Path]) -> tuple[list[Path], list[str]]:
             rejected.append(str(path))
             continue
         try:
-            candidates = discover_files([path.resolve()])
+            if path.is_dir():
+                candidates = _iter_supported_files(path.resolve())
+            else:
+                candidates = discover_files([path.resolve()])
         except ValueError as exc:
             if path.is_dir():
                 rejected.append(f"{path}（{exc}）")
@@ -146,6 +196,9 @@ class GeneralDataApp:
         self.root.minsize(1020, 760)
 
         self._paths: list[Path] = []
+        self._path_keys: list[str] = []
+        self._table_keys: list[str] = []
+        self._key_cache: dict[str, str] = {}
         self._tables: list[dict[str, Any]] = []
         self._tables_by_iid: dict[str, dict[str, Any]] = {}
         self._plots: dict[tuple[str, str | None], dict[str, Any]] = {}
@@ -160,6 +213,19 @@ class GeneralDataApp:
         self._import_process = None
         self._import_recv = None
         self._import_messages: list[dict[str, Any]] = []
+        self._import_result: dict[str, Any] | None = None
+        self._import_exit_waits = 0
+        self._import_eof = False
+        self._summaries = SummaryStore()
+        self._source_errors: dict[str, str] = {}
+        self._fingerprints: dict[tuple[str, str | None], tuple[Any, str]] = {}
+        self._iids_by_path: dict[str, list[str]] = {}
+        self._pending_outcomes: deque[tuple[dict[str, Any], str]] = deque()
+        self._job_terminal = False
+        self._job_error: str | None = None
+        self._done_message: dict[str, Any] | None = None
+        self._poll_confirms = 0
+        self._iid_seq = 0
         self._busy = False
         self._interactive: list[tk.Widget] = []
         self._widget_states: dict[tk.Widget, str] = {}
@@ -212,16 +278,17 @@ class GeneralDataApp:
         source_frame.pack(fill=tk.BOTH, expand=True, pady=(8, 0))
         self.table_tree = ttk.Treeview(
             source_frame,
-            columns=("source", "sheet", "rows", "columns"),
+            columns=("source", "sheet", "rows", "columns", "state"),
             show="headings",
             height=6,
             selectmode="browse",
         )
         for column, heading, width, anchor in (
-            ("source", "文件", 450, tk.W),
-            ("sheet", "工作表", 170, tk.W),
-            ("rows", "行数", 80, tk.E),
-            ("columns", "列数", 80, tk.E),
+            ("source", "文件", 360, tk.W),
+            ("sheet", "工作表", 140, tk.W),
+            ("rows", "行数", 70, tk.E),
+            ("columns", "列数", 70, tk.E),
+            ("state", "状态", 280, tk.W),
         ):
             self.table_tree.heading(column, text=heading)
             self.table_tree.column(column, width=width, anchor=anchor, stretch=column == "source")
@@ -342,24 +409,51 @@ class GeneralDataApp:
             self._add_paths([folder])
 
     def _add_paths(self, raw_paths: list[str | Path], announce: bool = True) -> None:
-        try:
-            paths, rejected = _collect_supported(raw_paths)
-        except Exception as exc:
-            messagebox.showerror("无法读取数据源", str(exc), parent=self.root)
+        if self._busy:
             return
-        existing = {_normalized_path(path) for path in self._paths}
-        added = [path for path in paths if _normalized_path(path) not in existing]
-        if rejected:
-            messagebox.showwarning("忽略不支持的文件", "以下文件格式不在支持列表中：\n" + "\n".join(rejected[:8]), parent=self.root)
-        if not added:
-            if announce and not rejected:
-                self.status_var.set("没有发现新的支持格式文件。")
+        options = self._try_read_options()
+        if options is None:
             return
-        self._save_current_plot()
-        self._paths.extend(added)
-        self._loaded_plan = None
-        self._plan_base_dir = None
-        self._inspect_paths()
+        requested = [Path(path) for path in raw_paths]
+        existing = list(self._paths)
+        self.status_var.set("正在后台扫描文件…")
+
+        def scan_task() -> None:
+            try:
+                found, rejected = _collect_supported(requested)
+            except Exception as exc:
+                self._thread_queue.put({"kind": "job_error", "error": str(exc)})
+                return
+            existing_keys = set()
+            for index, path in enumerate(existing):
+                existing_keys.add(_source_key({"path": path})[0])
+                if index % 25 == 0:
+                    time.sleep(0)
+            added = []
+            added_records = []
+            for index, path in enumerate(found):
+                key = _source_key({"path": path})[0]
+                if key not in existing_keys:
+                    added.append(path)
+                    added_records.append((path, key))
+                if index % 25 == 0:
+                    time.sleep(0)
+            self._thread_queue.put({
+                "kind": "scan",
+                "added": added_records,
+                "rejected": rejected,
+                "announce": announce,
+            })
+            self._inspect_paths_worker(added, options, "replace")
+            self._thread_queue.put({
+                "kind": "inspect_done",
+                "mode": "add",
+                "added_count": len(added),
+                "announce": announce,
+                "rejected_count": len(rejected),
+            })
+
+        self._start_thread(scan_task, "scan")
 
     def remove_selected_sources(self) -> None:
         selected = self.table_tree.selection()
@@ -367,15 +461,37 @@ class GeneralDataApp:
             return
         self._save_current_plot()
         remove_keys = {_normalized_path(self._tables_by_iid[iid]["source"]["path"]) for iid in selected}
-        self._paths = [path for path in self._paths if _normalized_path(path) not in remove_keys]
-        self._tables = [table for table in self._tables if _normalized_path(table["source"]["path"]) not in remove_keys]
+        kept_paths: list[Path] = []
+        kept_keys: list[str] = []
+        for path, key in zip(self._paths, self._path_keys):
+            if key not in remove_keys:
+                kept_paths.append(path)
+                kept_keys.append(key)
+        self._paths = kept_paths
+        self._path_keys = kept_keys
+        kept_tables: list[dict[str, Any]] = []
+        kept_table_keys: list[str] = []
+        for table, key in zip(self._tables, self._table_keys):
+            if key not in remove_keys:
+                kept_tables.append(table)
+                kept_table_keys.append(key)
+        self._tables = kept_tables
+        self._table_keys = kept_table_keys
         self._loaded_plan = None
         self._plan_base_dir = None
-        self._plots = {key: plot for key, plot in self._plots.items() if key[0] not in remove_keys}
-        self._populate_tables(self._tables)
-        if self._paths:
-            self._inspect_paths()
+        for path_key in remove_keys:
+            self._source_errors.pop(path_key, None)
+            self._drop_path_memory(path_key)
+            for iid in self._iids_by_path.pop(path_key, []):
+                self._tables_by_iid.pop(iid, None)
+                if self.table_tree.exists(iid):
+                    self.table_tree.delete(iid)
+        if self.table_tree.get_children():
+            self._ensure_selection()
+            self.status_var.set("已移除数据源。")
         else:
+            self._current_key = None
+            self._current_table = None
             self._show_table(None)
             self.status_var.set("已移除数据源。")
 
@@ -383,103 +499,447 @@ class GeneralDataApp:
         if not self._paths or self._busy:
             return
         self._save_current_plot()
+        options = self._try_read_options()
+        if options is None:
+            return
         self._loaded_plan = None
         self._plan_base_dir = None
-        self._inspect_paths()
+        paths = list(self._paths)
+        self.status_var.set("正在后台重新检查来源…")
 
-    def _inspect_paths(self) -> None:
+        def reload_task() -> None:
+            try:
+                self._inspect_paths_worker(paths, options, "replace")
+                self._thread_queue.put({"kind": "inspect_done", "mode": "reload", "added_count": len(paths), "announce": False})
+            except Exception as exc:
+                self._thread_queue.put({"kind": "job_error", "error": str(exc)})
+
+        self._start_thread(reload_task, "inspect")
+
+    def _try_read_options(self) -> dict[str, Any] | None:
         try:
             options = _read_options(self.header_var.get(), self.skip_rows_var.get(), self.delimiter_var.get())
         except (ValueError, tk.TclError) as exc:
             messagebox.showerror("读取选项无效", f"跳过行数必须是非负整数：{exc}", parent=self.root)
-            return
+            return None
         if options["skip_rows"] < 0:
             messagebox.showerror("读取选项无效", "跳过行数必须大于或等于 0。", parent=self.root)
-            return
-        paths = [str(path) for path in self._paths]
-        self.status_var.set("正在检查文件并读取数据预览…")
+            return None
+        return options
 
-        def inspect_task() -> None:
-            try:
-                result = planning.inspect_inputs(paths, options=options)
-                self._thread_queue.put({"kind": "inspect", "result": result})
-            except Exception as exc:
-                self._thread_queue.put({"kind": "inspect", "error": str(exc)})
+    def _inspect_paths(self) -> None:
+        """Re-check every current source. Retained for callers that reload in place."""
+        self.reload_inputs()
 
-        self._start_thread(inspect_task, "inspect")
+    def _inspect_paths_worker(self, paths: list[Path], options: dict[str, Any], update: str) -> None:
+        for path in paths:
+            outcome = self._summaries.inspect_path(path, options)
+            outcome["path_key"] = _source_key({"path": outcome.get("path") or path})[0]
+            self._thread_queue.put({"kind": "source", "outcome": outcome, "update": update})
+            # Yield so the Tk thread can paint while hundreds of sources are parsed.
+            time.sleep(0)
 
     def _inspect_plan_sources(self, plan: dict[str, Any]) -> None:
         plan_tables = copy.deepcopy(plan["tables"])
-        self.status_var.set("正在重新读取导入计划中的文件和工作表…")
+        base_dir = self._plan_base_dir
+        self.status_var.set("正在后台重新读取导入计划中的文件和工作表…")
 
         def inspect_task() -> None:
-            inspected: list[dict[str, Any]] = []
             try:
                 for plan_table in plan_tables:
                     source = plan_table["source"]
                     options = dict(source.get("options") or {})
-                    source_path = _resolve_plan_path(source["path"], self._plan_base_dir)
-                    result = planning.inspect_inputs([source_path], options=options)
-                    inspected.extend(result.get("tables", []))
-                self._thread_queue.put({"kind": "load_plan", "tables": inspected})
+                    source_path = _resolve_plan_path(source["path"], base_dir)
+                    outcome = self._summaries.inspect_path(source_path, options)
+                    self._thread_queue.put({"kind": "source", "outcome": outcome, "update": "append"})
+                self._thread_queue.put({
+                    "kind": "inspect_done",
+                    "mode": "load_plan",
+                    "added_count": len(plan_tables),
+                    "announce": False,
+                })
             except Exception as exc:
-                self._thread_queue.put({"kind": "load_plan", "error": str(exc)})
+                self._thread_queue.put({"kind": "job_error", "error": str(exc)})
 
         self._start_thread(inspect_task, "load_plan")
 
     def _start_thread(self, target, kind: str) -> None:
         if self._busy:
             return
+        self._job_terminal = False
+        self._job_error = None
+        self._done_message = None
+        self._poll_confirms = 0
+        self._pending_outcomes.clear()
         self._set_busy(True)
         self._thread_kind = kind
         self._thread = threading.Thread(target=target, name=f"origin-bridge-{kind}", daemon=True)
         self._thread.start()
-        self.root.after(80, self._poll_thread)
+        self.root.after(16, self._poll_thread)
 
     def _poll_thread(self) -> None:
-        try:
-            message = self._thread_queue.get_nowait()
-        except queue.Empty:
-            thread = self._thread
-            if thread is not None and thread.is_alive():
-                self.root.after(80, self._poll_thread)
-                return
-            if thread is not None:
-                thread.join()
+        started = time.monotonic()
+        handled = 0
+        while handled < _UI_MESSAGE_BUDGET and (time.monotonic() - started) < _UI_FRAME_SECONDS:
             try:
                 message = self._thread_queue.get_nowait()
             except queue.Empty:
-                self._thread = None
-                self._set_busy(False)
-                return
-        if message is not None:
-            self._thread = None
-            self._set_busy(False)
-            kind = message.get("kind")
-            if message.get("error"):
-                self.status_var.set("读取失败。")
-                messagebox.showerror("数据读取失败", message["error"], parent=self.root)
-            elif kind == "inspect":
-                result = message["result"]
-                tables = result.get("tables", [])
-                self._tables = tables
-                for table in tables:
-                    key = _source_key(table["source"])
-                    self._plots.setdefault(key, copy.deepcopy(table.get("suggested_plot") or self._default_plot(table)))
-                self._populate_tables(tables)
-                warnings = list(result.get("warnings", []))
-                warnings.extend(
-                    warning
-                    for table in tables
-                    for warning in table.get("warnings", [])
-                )
-                self.status_var.set(f"已读取 {len(tables)} 个数据表。" + (" " + "；".join(map(str, warnings)) if warnings else ""))
-            elif kind == "load_plan":
-                tables = message["tables"]
-                self._tables = tables
-                self._populate_tables(tables)
-                self.status_var.set(f"计划数据已读取，共 {len(tables)} 个数据表；导出前会再次验证源文件。")
+                break
+            handled += 1
+            self._dispatch_worker_message(message)
+        flushed = self._flush_outcomes(started)
+        if flushed and self._paths:
+            seen = len(self._tables) + len(self._source_errors)
+            self.status_var.set(f"正在检查来源 {seen}/{len(self._paths)}…")
+        thread = self._thread
+        alive = thread is not None and thread.is_alive()
+        more = bool(self._pending_outcomes) or not self._thread_queue.empty()
+        if alive or more:
+            self._poll_confirms = 0
+            self.root.after(16, self._poll_thread)
             return
+        if thread is not None:
+            thread.join(timeout=0.2)
+            if thread.is_alive() or not self._thread_queue.empty() or self._pending_outcomes:
+                self.root.after(16, self._poll_thread)
+                return
+        if not self._job_terminal and self._poll_confirms < 1:
+            self._poll_confirms += 1
+            self.root.after(16, self._poll_thread)
+            return
+        if not self._job_terminal:
+            self._job_error = self._job_error or "后台读取意外结束。"
+            self._job_terminal = True
+        self._finish_source_job()
+
+    def _dispatch_worker_message(self, message: dict[str, Any]) -> None:
+        kind = message.get("kind")
+        if kind == "job_error":
+            self._job_error = str(message.get("error") or "读取失败")
+            self._job_terminal = True
+            return
+        if kind == "scan":
+            self._apply_scan(message)
+            return
+        if kind == "source":
+            outcome = message.get("outcome")
+            if isinstance(outcome, dict):
+                self._pending_outcomes.append((outcome, str(message.get("update") or "replace")))
+            return
+        if kind == "inspect_done":
+            self._done_message = message
+            self._job_terminal = True
+
+    def _apply_scan(self, message: dict[str, Any]) -> None:
+        rejected = [str(item) for item in message.get("rejected") or []]
+        added = list(message.get("added") or [])
+        if rejected:
+            messagebox.showwarning(
+                "忽略不支持的文件",
+                "以下文件格式不在支持列表中：\n" + "\n".join(rejected[:8]),
+                parent=self.root,
+            )
+        if added:
+            self._save_current_plot()
+            self._remember_added(added)
+            self._loaded_plan = None
+            self._plan_base_dir = None
+            return
+        if message.get("announce", True) and not rejected:
+            self.status_var.set("没有发现新的支持格式文件。")
+
+    def _flush_outcomes(self, started: float) -> int:
+        flushed = 0
+        while self._pending_outcomes and flushed < _UI_ROW_BUDGET and (time.monotonic() - started) < _UI_FRAME_SECONDS:
+            outcome, update = self._pending_outcomes.popleft()
+            self._apply_outcome(outcome, update)
+            flushed += 1
+        return flushed
+
+    def _cached_path_key(self, path: str | Path) -> str:
+        text = os.path.normcase(str(path))
+        cached = self._key_cache.get(text)
+        if cached is None:
+            cached = _source_key({"path": path})[0]
+            self._key_cache[text] = cached
+            self._key_cache[cached] = cached
+        return cached
+
+    def _table_identity(self, source: dict[str, Any]) -> tuple[str, str | None]:
+        options = source.get("options") or {}
+        sheet = options.get("sheet", source.get("sheet"))
+        return self._cached_path_key(source.get("path", "")), str(sheet) if sheet is not None else None
+
+    def _remember_key(self, path: str | Path, key: str) -> None:
+        self._key_cache[os.path.normcase(str(path))] = key
+        self._key_cache[key] = key
+
+    def _remember_added(self, added: list[Any]) -> None:
+        for item in added:
+            if isinstance(item, tuple):
+                path, key = item
+            else:
+                path, key = item, self._cached_path_key(item)
+            self._paths.append(Path(path))
+            self._path_keys.append(key)
+            self._remember_key(path, key)
+
+    def _apply_outcome(self, outcome: dict[str, Any], update: str) -> None:
+        path = str(outcome.get("path") or "")
+        path_key = str(outcome.get("path_key") or self._cached_path_key(path))
+        self._remember_key(path, path_key)
+        for table in outcome.get("tables") or []:
+            source_path = (table.get("source") or {}).get("path")
+            if source_path:
+                self._remember_key(source_path, path_key)
+        if not outcome.get("ok"):
+            error = str(outcome.get("error") or "读取失败")
+            self._source_errors[path_key] = error
+            error_row = self._error_row(path, error)
+            if update == "append":
+                self._append_row(error_row)
+            else:
+                self._remove_path_tables(path_key)
+                self._drop_path_memory(path_key)
+                self._replace_path_rows(path_key, [error_row])
+            return
+        requested = str(outcome.get("requested_fingerprint") or "")
+        fresh_tables = list(outcome.get("tables") or [])
+        if update != "append" and outcome.get("reused") and self._same_cached_rows(path_key, fresh_tables, requested):
+            self._source_errors.pop(path_key, None)
+            return
+        if update != "append":
+            self._source_errors.pop(path_key, None)
+            self._remove_path_tables(path_key)
+        for table in fresh_tables:
+            source = table.get("source") or {}
+            key = self._table_identity(source)
+            new_fp = (source.get("sha256"), requested)
+            old_fp = self._fingerprints.get(key)
+            if old_fp is not None and old_fp != new_fp:
+                self._plots.pop(key, None)
+                self._column_labels.pop(key, None)
+            self._fingerprints[key] = new_fp
+            self._plots.setdefault(key, copy.deepcopy(table.get("suggested_plot") or self._default_plot(table)))
+        if update == "append":
+            for table in fresh_tables:
+                self._tables.append(table)
+                self._table_keys.append(path_key)
+                self._append_row(table)
+            return
+        self._insert_tables_in_path_order(path_key, fresh_tables)
+        self._replace_path_rows(path_key, fresh_tables)
+
+    def _finish_source_job(self) -> None:
+        done = self._done_message or {}
+        error = self._job_error
+        self._thread = None
+        self._thread_kind = None
+        self._job_error = None
+        self._done_message = None
+        self._set_busy(False)
+        self._ensure_selection()
+        if error:
+            self.status_var.set("读取失败。")
+            messagebox.showerror("数据读取失败", error, parent=self.root)
+            return
+        if done.get("mode") == "add" and not done.get("added_count") and not self._source_errors:
+            return
+        failed = len(self._source_errors)
+        if done.get("mode") == "load_plan":
+            text = f"计划数据已读取，共 {len(self._tables)} 个数据表；导出前会再次验证源文件。"
+        else:
+            text = f"已读取 {len(self._tables)} 个数据表。"
+        if failed:
+            text += f" {failed} 个来源读取失败，单工程不会导出不完整计划。"
+        elif len(self._tables) <= 3:
+            warnings = [str(warning) for table in self._tables for warning in (table.get("warnings") or [])]
+            if warnings:
+                text += " " + "；".join(warnings[:3])
+        self.status_var.set(text)
+
+    def _same_cached_rows(self, path_key: str, tables: list[dict[str, Any]], requested: str) -> bool:
+        iids = self._iids_by_path.get(path_key) or []
+        if len(iids) != len(tables) or not iids:
+            return False
+        for table in tables:
+            source = table.get("source") or {}
+            key = self._table_identity(source)
+            if self._fingerprints.get(key) != (source.get("sha256"), requested):
+                return False
+            if key not in self._plots:
+                return False
+        return all(self.table_tree.exists(iid) for iid in iids)
+
+    def _error_row(self, path: str, error: str) -> dict[str, Any]:
+        return {
+            "source": {"path": path, "sheet": None, "sha256": "", "options": {}},
+            "name": Path(path).stem,
+            "n_rows": 0,
+            "columns": [],
+            "warnings": [],
+            "error": error,
+            "suggested_plot": None,
+        }
+
+    def _drop_path_memory(self, path_key: str) -> None:
+        for key in [key for key in self._plots if key[0] == path_key]:
+            self._plots.pop(key, None)
+            self._column_labels.pop(key, None)
+            self._fingerprints.pop(key, None)
+        for key in [key for key in self._fingerprints if key[0] == path_key]:
+            self._fingerprints.pop(key, None)
+
+    def _remove_path_tables(self, path_key: str) -> None:
+        self._align_table_keys()
+        kept_tables: list[dict[str, Any]] = []
+        kept_keys: list[str] = []
+        for table, key in zip(self._tables, self._table_keys):
+            if key != path_key:
+                kept_tables.append(table)
+                kept_keys.append(key)
+        self._tables = kept_tables
+        self._table_keys = kept_keys
+
+    def _align_table_keys(self) -> None:
+        if len(self._table_keys) == len(self._tables):
+            return
+        self._table_keys = [self._cached_path_key((table.get("source") or {}).get("path", "")) for table in self._tables]
+
+    def _insert_tables_in_path_order(self, path_key: str, tables: list[dict[str, Any]]) -> None:
+        self._align_table_keys()
+        if len(self._path_keys) != len(self._paths):
+            self._path_keys = [self._cached_path_key(path) for path in self._paths]
+        grouped: dict[str, list[dict[str, Any]]] = {}
+        for table, key in zip(self._tables, self._table_keys):
+            grouped.setdefault(key, []).append(table)
+        grouped[path_key] = list(tables)
+        ordered: list[dict[str, Any]] = []
+        ordered_keys: list[str] = []
+        seen: set[str] = set()
+        for key in self._path_keys:
+            if key in seen:
+                continue
+            seen.add(key)
+            for table in grouped.get(key, []):
+                ordered.append(table)
+                ordered_keys.append(key)
+        for key, items in grouped.items():
+            if key not in seen:
+                for table in items:
+                    ordered.append(table)
+                    ordered_keys.append(key)
+        self._tables = ordered
+        self._table_keys = ordered_keys
+
+    def _row_values(self, table: dict[str, Any]) -> tuple[Any, ...]:
+        source = table.get("source") or {}
+        if table.get("error"):
+            return (source.get("path", ""), "", "错误", "", table.get("error", ""))
+        return (
+            source.get("path", ""),
+            source.get("sheet") or "",
+            table.get("n_rows", ""),
+            len(table.get("columns") or []),
+            "就绪",
+        )
+
+    def _next_iid(self) -> str:
+        self._iid_seq += 1
+        return f"s{self._iid_seq}"
+
+    def _insert_row_at(self, table: dict[str, Any], index: int | str) -> str:
+        iid = self._next_iid()
+        self._tables_by_iid[iid] = table
+        self.table_tree.insert("", index, iid=iid, values=self._row_values(table))
+        path_key = self._cached_path_key((table.get("source") or {}).get("path", ""))
+        self._iids_by_path.setdefault(path_key, []).append(iid)
+        return iid
+
+    def _append_row(self, table: dict[str, Any]) -> None:
+        self._insert_row_at(table, tk.END)
+
+    def _replace_path_rows(self, path_key: str, tables: list[dict[str, Any]]) -> None:
+        old = self._iids_by_path.get(path_key, [])
+        index: int | str = "end"
+        if old and self.table_tree.exists(old[0]):
+            index = self.table_tree.index(old[0])
+        for iid in old:
+            self._tables_by_iid.pop(iid, None)
+            if self.table_tree.exists(iid):
+                self.table_tree.delete(iid)
+        new_iids: list[str] = []
+        # _insert_row_at appends to _iids_by_path; seed it empty and refill below.
+        self._iids_by_path[path_key] = []
+        for offset, table in enumerate(tables):
+            if index == "end":
+                new_iids.append(self._insert_row_at(table, tk.END))
+            else:
+                new_iids.append(self._insert_row_at(table, int(index) + offset))
+        self._iids_by_path[path_key] = new_iids
+
+    def _clear_listed_sources(self) -> None:
+        self._tables.clear()
+        self._table_keys.clear()
+        self._tables_by_iid.clear()
+        self._iids_by_path.clear()
+        self._pending_outcomes.clear()
+        children = self.table_tree.get_children()
+        if children:
+            self.table_tree.delete(*children)
+        self._current_key = None
+        self._current_table = None
+        self._show_table(None)
+
+    def _ensure_selection(self) -> None:
+        children = self.table_tree.get_children()
+        if not children:
+            self._current_key = None
+            self._current_table = None
+            self._show_table(None)
+            return
+        wanted = self._current_key
+        chosen = None
+        if wanted is not None:
+            for iid in children:
+                table = self._tables_by_iid.get(iid)
+                if table is not None and self._table_identity(table["source"]) == wanted:
+                    chosen = iid
+                    break
+        if chosen is None:
+            current = self.table_tree.selection()
+            if current and current[0] in self._tables_by_iid:
+                chosen = current[0]
+            else:
+                chosen = children[0]
+        self.table_tree.selection_set(chosen)
+        self.table_tree.focus(chosen)
+        self._select_table(self._tables_by_iid[chosen])
+
+    def _populate_tables(self, tables: list[dict[str, Any]]) -> None:
+        """Rebuild source rows in frame-sized slices. ``tables`` are summaries, not raw data."""
+        rows = [table for table in tables if isinstance(table, dict)]
+        self._tables = [table for table in rows if not table.get("error")]
+        self._table_keys = [self._cached_path_key((table.get("source") or {}).get("path", "")) for table in self._tables]
+        self._tables_by_iid.clear()
+        self._iids_by_path.clear()
+        children = self.table_tree.get_children()
+        if children:
+            self.table_tree.delete(*children)
+        pending: deque[dict[str, Any]] = deque(rows)
+
+        def flush_rebuild() -> None:
+            started = time.monotonic()
+            flushed = 0
+            while pending and flushed < _UI_ROW_BUDGET and (time.monotonic() - started) < _UI_FRAME_SECONDS:
+                self._append_row(pending.popleft())
+                flushed += 1
+            if pending:
+                self.root.after(16, flush_rebuild)
+                return
+            self._ensure_selection()
+
+        flush_rebuild()
 
     @staticmethod
     def _default_plot(table: dict[str, Any]) -> dict[str, Any]:
@@ -530,13 +990,21 @@ class GeneralDataApp:
         self._select_table(self._tables_by_iid[selection[0]] if selection else None)
 
     def _select_table(self, table: dict[str, Any] | None) -> None:
-        self._current_key = _source_key(table["source"]) if table else None
+        self._current_key = self._table_identity(table["source"]) if table else None
         self._current_table = table
         self._show_table(table)
 
     def _show_table(self, table: dict[str, Any] | None) -> None:
         self.column_tree.delete(*self.column_tree.get_children())
         self.sample_tree.delete(*self.sample_tree.get_children())
+        if table is not None and table.get("error"):
+            self.sample_tree.configure(columns=())
+            self.sample_tree["show"] = "headings"
+            self.y_list.delete(0, tk.END)
+            self.x_combo.configure(values=("行号",))
+            self.error_combo.configure(values=("无",))
+            self.status_var.set(f"来源读取失败：{table['error']}")
+            return
         if table is None:
             self.sample_tree.configure(columns=())
             self.sample_tree["show"] = "headings"
@@ -573,7 +1041,7 @@ class GeneralDataApp:
         self._load_plot_controls(table, numeric)
 
     def _load_plot_controls(self, table: dict[str, Any], numeric: list[str]) -> None:
-        key = _source_key(table["source"])
+        key = self._table_identity(table["source"])
         plot = copy.deepcopy(self._plots.get(key) or table.get("suggested_plot") or self._default_plot(table))
         columns = table.get("columns", [])
         self.plot_kind_var.set(str(plot.get("kind", "line")))
@@ -619,7 +1087,7 @@ class GeneralDataApp:
 
     def _save_current_plot(self) -> None:
         key = self._current_key
-        if key is None:
+        if key is None or (self._current_table or {}).get("error"):
             return
         selected_y = [self.y_list.get(index) for index in self.y_list.curselection()]
         y_indexes = [index for value in selected_y if (index := self._display_index(value)) is not None]
@@ -663,8 +1131,29 @@ class GeneralDataApp:
         except (AttributeError, tk.TclError):
             pass
 
+    def _reject_incomplete_sources(self) -> None:
+        """Single-project plans refuse failed or not-yet-inspected sources.
+
+        A later batch phase must not treat "every inspect succeeded" as given.
+        ``batch_source_snapshot`` exposes per-source errors separately from summaries.
+        """
+        errors = getattr(self, "_source_errors", None) or {}
+        if errors:
+            path, detail = next(iter(errors.items()))
+            raise ValueError(f"有数据源读取失败，不能保存或导出不完整的单工程计划：{path}：{detail}")
+        paths = getattr(self, "_paths", None) or []
+        tables = [table for table in (getattr(self, "_tables", None) or []) if not table.get("error")]
+        inspected = {_source_key(table["source"])[0] for table in tables if table.get("source")}
+        missing = {_normalized_path(path) for path in paths} - inspected
+        if not missing:
+            return
+        if getattr(self, "_loaded_plan", None) is not None:
+            raise ValueError("有数据源尚未完成读取或读取失败，不能保存或导出不完整的单工程计划。")
+        raise ValueError("有数据源尚未完成读取。请点击“重新读取”并等待完成后再保存计划或导出。")
+
     def _effective_plan(self, output: Path, fmt: str, overwrite: bool) -> dict[str, Any]:
         self._save_current_plot()
+        self._reject_incomplete_sources()
         expected_suffix = _FORMAT_SUFFIX.get(fmt)
         if expected_suffix is None:
             raise ValueError(f"不支持的输出格式：{fmt}")
@@ -680,15 +1169,16 @@ class GeneralDataApp:
         else:
             if not self._paths:
                 raise ValueError("请先添加至少一个数据文件。")
-            input_keys = {_normalized_path(path) for path in self._paths}
-            inspected_keys = {_source_key(table["source"])[0] for table in self._tables}
-            missing = input_keys - inspected_keys
-            if missing:
-                raise ValueError("有数据源尚未完成读取。请点击“重新读取”并等待完成后再保存计划或导出。")
             plan_tables = []
             for table in self._tables:
+                if table.get("error"):
+                    continue
                 source = table["source"]
                 key = _source_key(source)
+                if getattr(self, "_key_cache", None) is not None:
+                    alternate = self._table_identity(source)
+                    if key not in self._plots and alternate in self._plots:
+                        key = alternate
                 plan_tables.append({
                     "source": {field: source[field] for field in ("path", "sha256", "options")},
                     "name": table["name"],
@@ -799,6 +1289,9 @@ class GeneralDataApp:
         self._import_recv = recv_conn
         self._import_process = process
         self._import_messages = []
+        self._import_result = None
+        self._import_exit_waits = 0
+        self._import_eof = False
         self._set_busy(True)
         self.root.after(100, self._poll_import)
 
@@ -807,28 +1300,75 @@ class GeneralDataApp:
         recv_conn = self._import_recv
         if process is None or recv_conn is None:
             return
-        while True:
+        started = time.monotonic()
+        taken = 0
+        while taken < _IMPORT_MESSAGE_BUDGET and (time.monotonic() - started) < _IMPORT_FRAME_SECONDS:
             try:
                 if not recv_conn.poll():
                     break
                 message = recv_conn.recv()
-                self._import_messages.append(message)
-                if message.get("type") == "progress":
-                    self.status_var.set(message.get("text", "正在导出…"))
             except (EOFError, OSError):
+                self._import_eof = True
                 break
-        if process.is_alive():
+            taken += 1
+            if not isinstance(message, dict):
+                continue
+            if message.get("type") == "result":
+                result = message.get("result")
+                if isinstance(result, dict):
+                    self._import_result = result
+            elif message.get("type") == "progress":
+                text = message.get("text")
+                if text:
+                    self.status_var.set(str(text))
+        try:
+            alive = process.is_alive()
+        except ValueError:
+            alive = False
+        if alive:
+            self._import_exit_waits = 0
             self.root.after(120, self._poll_import)
             return
-        process.join()
-        result_messages = [message.get("result") for message in self._import_messages if message.get("type") == "result"]
-        exit_code = process.exitcode
-        process.close()
-        recv_conn.close()
+        if not self._import_eof:
+            try:
+                if recv_conn.poll():
+                    self.root.after(1, self._poll_import)
+                    return
+            except (EOFError, OSError):
+                self._import_eof = True
+        if self._import_result is None and not self._import_eof and self._import_exit_waits < _IMPORT_EXIT_POLLS:
+            self._import_exit_waits += 1
+            self.root.after(30, self._poll_import)
+            return
+        self._complete_import()
+
+    def _complete_import(self) -> None:
+        process = self._import_process
+        recv_conn = self._import_recv
         self._import_process = None
         self._import_recv = None
+        exit_code = None
+        if process is not None:
+            try:
+                if process.is_alive():
+                    process.join(timeout=1)
+            except ValueError:
+                pass
+            exit_code = getattr(process, "exitcode", None)
+            try:
+                process.close()
+            except ValueError:
+                pass
+        if recv_conn is not None:
+            try:
+                recv_conn.close()
+            except OSError:
+                pass
         self._set_busy(False)
-        result = result_messages[-1] if result_messages else {"ok": False, "error": f"后台进程未返回结果（退出码 {exit_code}）。"}
+        result = self._import_result if isinstance(self._import_result, dict) else {
+            "ok": False,
+            "error": f"后台进程未返回结果（退出码 {exit_code}）。",
+        }
         if result.get("ok"):
             output = result.get("output", {})
             warnings = result.get("warnings", [])
@@ -921,14 +1461,23 @@ class GeneralDataApp:
             self._paths = list(dict.fromkeys(
                 _resolve_plan_path(item["source"]["path"], self._plan_base_dir) for item in plan["tables"]
             ))
+            self._path_keys = [self._cached_path_key(path) for path in self._paths]
             self._plots.clear()
             self._column_labels.clear()
+            self._fingerprints.clear()
+            self._source_errors.clear()
             for item in plan["tables"]:
                 key = _plan_table_key(item, self._plan_base_dir)
                 if isinstance(item.get("plot"), dict):
                     self._plots[key] = copy.deepcopy(item["plot"])
                 if isinstance(item.get("column_labels"), dict):
                     self._column_labels[key] = copy.deepcopy(item["column_labels"])
+                source = item["source"]
+                self._fingerprints[key] = (
+                    source.get("sha256"),
+                    options_fingerprint(source.get("options") or {}),
+                )
+            self._clear_listed_sources()
             output = plan["output"]
             fmt = output.get("format", "opju")
             self.format_var.set(fmt if fmt in _FORMAT_SUFFIX else "opju")
@@ -974,6 +1523,24 @@ class GeneralDataApp:
             self.table_tree.state(["disabled"] if busy else ["!disabled"])
         except tk.TclError:
             pass
+
+    def batch_source_snapshot(self) -> dict[str, Any]:
+        """Read-only handoff for a future batch phase.
+
+        ``tables`` are per-source summaries (column samples, not full data).
+        ``errors`` are sources that failed inspect and are not successful tables.
+        Batch export, cancel, and manifest are intentionally not wired. This
+        single-project window still refuses a plan while any source listed in
+        ``errors`` is unresolved or not yet inspected.
+        """
+        store = getattr(self, "_summaries", None)
+        return {
+            "paths": [str(path) for path in self._paths],
+            "tables": [table for table in self._tables if not table.get("error")],
+            "errors": dict(getattr(self, "_source_errors", {}) or {}),
+            "inspect_calls": getattr(store, "inspect_calls", 0),
+            "cache_hits": getattr(store, "cache_hits", 0),
+        }
 
     def _on_close(self) -> None:
         if self._busy:
