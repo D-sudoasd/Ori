@@ -9,7 +9,10 @@ import math
 import os
 import re
 import shutil
+import sys
 import tempfile
+import threading
+import time
 import zipfile
 from datetime import datetime
 from decimal import Decimal, InvalidOperation
@@ -39,7 +42,7 @@ _DATE_FMT = "yyyy-mm-dd hh:mm:ss.000"
 
 def execute_import(prepared: PreparedImport) -> dict[str, Any]:
     """Export a prepared import and return a JSON-serializable receipt."""
-    tables, output = _validate_prepared(prepared)
+    tables, output, converted, conversion_warnings, conversion_notes = _validate_prepared(prepared)
     _verify_sources(tables)
     output.parent.mkdir(parents=True, exist_ok=True)
 
@@ -49,15 +52,15 @@ def execute_import(prepared: PreparedImport) -> dict[str, Any]:
     stage_dir = Path(tempfile.mkdtemp(prefix=f".{output.stem}_origin_stage_", dir=output.parent))
     runtime_warnings: list[str] = []
     try:
-        if prepared.format == "xlsx":
-            staged = stage_dir / output.name
-            _write_xlsx(staged, tables)
-            if not staged.is_file() or staged.stat().st_size == 0:
-                raise DataImportError(f"Exporter did not create a non-empty output: {staged}")
-            _install_staged_file(staged, output, overwrite=prepared.overwrite)
-        else:
-            with _origin_export_lock():
-                staged = _write_opju(stage_dir, tables, prepared)
+        with origin_export_lock():
+            if prepared.format == "xlsx":
+                staged = stage_dir / output.name
+                _write_xlsx(staged, tables, converted, conversion_notes)
+                if not staged.is_file() or staged.stat().st_size == 0:
+                    raise DataImportError(f"Exporter did not create a non-empty output: {staged}")
+                _install_staged_file(staged, output, overwrite=prepared.overwrite)
+            else:
+                staged = _write_opju(stage_dir, tables, prepared, converted, conversion_notes)
                 if not staged.is_file() or staged.stat().st_size == 0:
                     raise DataImportError(f"Exporter did not create a non-empty output: {staged}")
                 _install_staged_file(staged, output, overwrite=prepared.overwrite)
@@ -80,7 +83,7 @@ def execute_import(prepared: PreparedImport) -> dict[str, Any]:
                 _table_receipt(item, sheet_name, prepared.format)
                 for item, sheet_name in zip(tables, _output_sheet_names(tables, prepared.format))
             ],
-            "warnings": _all_warnings(prepared, tables) + runtime_warnings,
+            "warnings": _all_warnings(prepared, tables, conversion_warnings) + runtime_warnings,
         }
         json.dumps(receipt, ensure_ascii=False)
         return receipt
@@ -90,11 +93,13 @@ def execute_import(prepared: PreparedImport) -> dict[str, Any]:
 
 def validate_prepared_import(prepared: PreparedImport) -> list[str]:
     """Validate the prepared export without writing files or launching Origin."""
-    tables, _output = _validate_prepared(prepared)
-    return _all_warnings(prepared, tables)
+    tables, _output, _converted, conversion_warnings, _notes = _validate_prepared(prepared)
+    return _all_warnings(prepared, tables, conversion_warnings)
 
 
-def _validate_prepared(prepared: PreparedImport) -> tuple[tuple[PlannedTable, ...], Path]:
+def _validate_prepared(
+    prepared: PreparedImport,
+) -> tuple[tuple[PlannedTable, ...], Path, list[list[list[Any]]], list[str], list[list[str]]]:
     if prepared.format not in {"xlsx", "opju"}:
         raise DataImportError("format must be 'xlsx' or 'opju'")
     if not prepared.tables:
@@ -105,6 +110,9 @@ def _validate_prepared(prepared: PreparedImport) -> tuple[tuple[PlannedTable, ..
 
     names: set[str] = set()
     source_hashes: dict[str, str] = {}
+    converted: list[list[list[Any]]] = []
+    conversion_warnings: list[str] = []
+    notes_by_table: list[list[str]] = []
     for planned in prepared.tables:
         table = planned.table
         if not planned.name.strip():
@@ -119,12 +127,20 @@ def _validate_prepared(prepared: PreparedImport) -> tuple[tuple[PlannedTable, ..
         if prepared.format == "xlsx" and table.n_rows + 1 > _XLSX_MAX_ROWS:
             raise DataImportError(f"Table exceeds the XLSX row limit: {planned.name}")
         n_rows = len(table.columns[0].values)
+        column_values: list[list[Any]] = []
+        column_notes: list[str] = []
         for column in table.columns:
             if column.kind not in {"number", "text", "datetime"}:
                 raise DataImportError(f"Unsupported column kind {column.kind!r}: {planned.name}/{column.name}")
             if len(column.values) != n_rows:
                 raise DataImportError(f"Columns have different row counts: {planned.name}")
-            _coerce_column(column, planned.name)
+            # One pass keeps the integrity checks and the warning facts together.
+            values, notes = _convert_column(column, planned.name, prepared.format)
+            column_values.append(values)
+            column_notes.extend(notes)
+        converted.append(column_values)
+        notes_by_table.append(column_notes)
+        conversion_warnings.extend(column_notes)
 
         source_path = Path(table.source).expanduser().resolve(strict=False)
         if _path_key(source_path) == _path_key(output):
@@ -138,7 +154,7 @@ def _validate_prepared(prepared: PreparedImport) -> tuple[tuple[PlannedTable, ..
         _validate_plot(planned)
 
     if prepared.format == "xlsx":
-        for row_index, values in enumerate(_provenance_rows(tuple(prepared.tables), "xlsx"), start=2):
+        for row_index, values in enumerate(_provenance_rows(tuple(prepared.tables), "xlsx", notes_by_table), start=2):
             for column_index, value in enumerate(values, start=1):
                 if len(value) > _XLSX_MAX_CELL_TEXT:
                     raise DataImportError(
@@ -155,7 +171,7 @@ def _validate_prepared(prepared: PreparedImport) -> tuple[tuple[PlannedTable, ..
 
     if output.exists() and not prepared.overwrite:
         raise FileExistsError(f"Output already exists and overwrite is disabled: {output}")
-    return tuple(prepared.tables), output
+    return tuple(prepared.tables), output, converted, conversion_warnings, notes_by_table
 
 
 def _validate_plot(planned: PlannedTable) -> None:
@@ -194,22 +210,102 @@ def _validate_plot(planned: PlannedTable) -> None:
 
 
 def _coerce_column(column: DataColumn, table_name: str) -> list[Any]:
+    """Convert one column. Prefer the list returned with warnings by ``_convert_column``."""
+    values, _notes = _convert_column(column, table_name, "opju")
+    return values
+
+
+def _convert_column(
+    column: DataColumn,
+    table_name: str,
+    output_format: str,
+) -> tuple[list[Any], list[str]]:
+    """Validate every cell once and collect the native-format warnings for that pass.
+
+    The returned lists are the values writers and the Origin read-back use. Callers
+    discard them with the export; this is not a cross-task cache.
+    """
     converted: list[Any] = []
+    empty_strings = 0
+    rounded: list[tuple[str, float]] = []
+    aware = 0
+    naive = 0
+    xlsx_submillisecond = 0
+    origin_submicrosecond = 0
     for row_index, value in enumerate(column.values, start=1):
         if value is None:
             converted.append("" if column.kind == "text" else None)
-        elif not isinstance(value, str):
-            raise DataImportError(f"Column value must be text or null: {table_name}/{column.name}, row {row_index}")
-        elif column.kind == "text":
+            continue
+        if not isinstance(value, str):
+            raise DataImportError(
+                f"Column value must be text or null: {table_name}/{column.name}, row {row_index}"
+            )
+        if column.kind == "text":
             converted.append(value)
-        elif column.kind == "number":
-            converted.append(_numeric_value(value, table_name, column.name, row_index))
+            if value == "":
+                empty_strings += 1
+            continue
+        if column.kind == "number":
+            exact, number = _numeric_parts(value, table_name, column.name, row_index)
+            converted.append(number)
+            if exact.is_finite() and math.isfinite(number) and Decimal(str(number)) != exact:
+                rounded.append((value, number))
+            continue
+        parsed = _parse_datetime(value, table_name, column.name, row_index)
+        if parsed.utcoffset() is not None:
+            from datetime import timezone
+
+            aware += 1
+            parsed = parsed.astimezone(timezone.utc).replace(tzinfo=None)
         else:
-            converted.append(_datetime_value(value, table_name, column.name, row_index))
-    return converted
+            naive += 1
+        converted.append(parsed)
+        fraction = re.search(r"[Tt ]\d{2}:\d{2}:\d{2}\.(\d+)", value)
+        if fraction:
+            digits = fraction.group(1)
+            if len(digits) > 3 and any(digit != "0" for digit in digits[3:]):
+                xlsx_submillisecond += 1
+            if len(digits) > 6 and any(digit != "0" for digit in digits[6:]):
+                origin_submicrosecond += 1
+
+    warnings: list[str] = []
+    if column.kind == "text" and output_format == "xlsx" and empty_strings:
+        warnings.append(
+            f"{table_name}/{column.name}: {empty_strings} empty string(s) are written as blank XLSX cells "
+            "and may read back as missing values"
+        )
+    elif column.kind == "number" and rounded:
+        raw, number = rounded[0]
+        warnings.append(
+            f"{table_name}/{column.name}: {len(rounded)} numeric value(s) were rounded "
+            f"to binary64; example {raw!r} -> {number!r}"
+        )
+    elif column.kind == "datetime":
+        if aware:
+            if naive:
+                warnings.append(
+                    f"{table_name}/{column.name}: mixed naive and timezone-aware timestamps; "
+                    f"{aware} aware value(s) converted to UTC and {naive} naive value(s) retained"
+                )
+            else:
+                warnings.append(
+                    f"{table_name}/{column.name}: {aware} timezone-aware timestamp(s) converted to UTC; "
+                    "the Origin date column does not store the original timezone"
+                )
+        if output_format == "xlsx" and xlsx_submillisecond:
+            warnings.append(
+                f"{table_name}/{column.name}: {xlsx_submillisecond} timestamp(s) have precision finer than "
+                "milliseconds; XLSX native date cells store milliseconds"
+            )
+        if output_format == "opju" and origin_submicrosecond:
+            warnings.append(
+                f"{table_name}/{column.name}: {origin_submicrosecond} timestamp(s) have precision finer than "
+                "microseconds; Origin date values are limited by datetime parsing and serial-number precision"
+            )
+    return converted, warnings
 
 
-def _numeric_value(raw: str, table_name: str, column_name: str, row_index: int) -> float:
+def _numeric_parts(raw: str, table_name: str, column_name: str, row_index: int) -> tuple[Decimal, float]:
     token = raw.strip().replace("d", "e").replace("D", "E")
     try:
         if not _NUMBER_RE.fullmatch(token):
@@ -228,7 +324,11 @@ def _numeric_value(raw: str, table_name: str, column_name: str, row_index: int) 
         raise DataImportError(
             f"Numeric value underflows to zero in {table_name}/{column_name}, row {row_index}: {raw!r}"
         )
-    return value
+    return exact, value
+
+
+def _numeric_value(raw: str, table_name: str, column_name: str, row_index: int) -> float:
+    return _numeric_parts(raw, table_name, column_name, row_index)[1]
 
 
 def _datetime_value(raw: str, table_name: str, column_name: str, row_index: int) -> datetime:
@@ -265,19 +365,25 @@ def _verify_sources(tables: tuple[PlannedTable, ...]) -> None:
             raise DataImportError(f"Source changed after planning; prepare the import again: {path}")
 
 
-def _write_xlsx(path: Path, tables: tuple[PlannedTable, ...]) -> None:
+def _write_xlsx(
+    path: Path,
+    tables: tuple[PlannedTable, ...],
+    converted: list[list[list[Any]]],
+    conversion_notes: list[list[str]] | None = None,
+) -> None:
     workbook = Workbook()
     workbook.remove(workbook.active)
     names = _output_sheet_names(tables, "xlsx")
-    for planned, sheet_name in zip(tables, names):
+    for table_index, (planned, sheet_name) in enumerate(zip(tables, names)):
         sheet = workbook.create_sheet(sheet_name)
+        column_values = converted[table_index]
         for column_index, column in enumerate(planned.table.columns, start=1):
             header = sheet.cell(1, column_index, column.name)
             header.data_type = "s"
             header.font = Font(bold=True)
             header.number_format = "@"
             sheet.column_dimensions[get_column_letter(column_index)].width = min(42, max(12, len(column.name) + 2))
-            for row_index, value in enumerate(_coerce_column(column, planned.name), start=2):
+            for row_index, value in enumerate(column_values[column_index - 1], start=2):
                 cell = sheet.cell(row_index, column_index)
                 if value is None:
                     continue
@@ -299,7 +405,7 @@ def _write_xlsx(path: Path, tables: tuple[PlannedTable, ...]) -> None:
         cell = provenance.cell(1, col_index, name)
         cell.data_type = "s"
         cell.font = Font(bold=True)
-    for row_index, values in enumerate(_provenance_rows(tables, "xlsx"), start=2):
+    for row_index, values in enumerate(_provenance_rows(tables, "xlsx", conversion_notes), start=2):
         for col_index, value in enumerate(values, start=1):
             cell = provenance.cell(row_index, col_index, value)
             cell.data_type = "s"
@@ -332,16 +438,21 @@ def _write_xlsx(path: Path, tables: tuple[PlannedTable, ...]) -> None:
 def _provenance_rows(
     tables: tuple[PlannedTable, ...],
     output_format: str,
+    conversion_notes: list[list[str]] | None = None,
 ) -> list[tuple[str, ...]]:
     rows: list[tuple[str, ...]] = []
     output_names = _output_sheet_names(tables, output_format)
-    for planned, output_name in zip(tables, output_names):
+    for index, (planned, output_name) in enumerate(zip(tables, output_names)):
         table = planned.table
+        if conversion_notes is None:
+            table_notes = _table_conversion_warnings(planned, output_format)
+        else:
+            table_notes = list(conversion_notes[index])
         source = str(Path(table.source).expanduser().resolve(strict=False))
         read_options = _json_text(table.read_options)
         notes = _json_text({
             "plot": _plot_dict(planned),
-            "warnings": list(table.warnings) + _table_conversion_warnings(planned, output_format),
+            "warnings": list(table.warnings) + table_notes,
             "output_sheet": output_name,
             "datetime_policy": "timezone-aware values converted to UTC; naive values retained",
             "numeric_policy": "Origin/XLSX number cells use finite binary64 values",
@@ -359,57 +470,83 @@ def _provenance_rows(
     return rows
 
 
-def _write_opju(stage_dir: Path, tables: tuple[PlannedTable, ...], prepared: PreparedImport) -> Path:
+def _write_opju(
+    stage_dir: Path,
+    tables: tuple[PlannedTable, ...],
+    prepared: PreparedImport,
+    converted: list[list[list[Any]]],
+    conversion_notes: list[list[str]] | None = None,
+) -> Path:
+    """Start one Origin session, write one project, and close that session."""
+    from .session import OriginSession, OriginSessionLost
+
     sto = _origin_support()
-    if sto.origin_process_running():
-        raise sto.OriginExportError("Origin is already running; close it before exporting a new project")
-    op = sto._load_originpro()
-    if sto.origin_process_running():
-        raise sto.OriginExportError("Origin started during export setup; the current session was left untouched")
-
-    pending_cleanup: list[Path] = []
+    session = OriginSession(timeout_s=0)
     try:
-        op.set_show(False)
-        op.new(False)
-        books = list(op.pages("w"))
-        if not books:
-            raise sto.OriginExportError("Origin did not create a workbook")
-        book = books[0]
-        book.lname = "Imported Data"
-        for extra in books[1:]:
-            extra.destroy()
-
-        short_names = _output_sheet_names(tables, "opju") + [_origin_provenance_sheet_name(tables)]
-        data_sheets = []
-        graph_pages = []
-        for index, (planned, short_name) in enumerate(zip(tables, short_names[:-1])):
-            sheet = book[0] if index == 0 else book.add_sheet(short_name)
-            sheet.name = short_name
-            sheet.lname = planned.name
-            _fill_origin_sheet(op, sheet, planned)
-            data_sheets.append(sheet)
-            if planned.plot.kind != "none":
-                graph_pages.append(_plot_origin_table(op, sheet, planned))
-
-        provenance = book.add_sheet(short_names[-1])
-        provenance.name = short_names[-1]
-        provenance.lname = "Import Provenance"
-        _fill_origin_provenance(provenance, tables)
-        _verify_origin_project(op, data_sheets, graph_pages, tables)
-
-        staged_project = stage_dir / "candidate.opju"
-        saved = sto._save_origin_project(op, staged_project, pending_cleanup)
+        session.start()
+        result = session.write_project(
+            stage_dir, tables, prepared, converted, pdf=False, conversion_notes=conversion_notes,
+        )
+        saved = result["opju"]
         if not saved.is_file() or saved.stat().st_size == 0:
             raise sto.OriginExportError("Origin did not create a usable .opju file")
         return saved
     except sto.OriginExportError:
         raise
+    except OriginSessionLost as exc:
+        raise sto.OriginExportError(str(exc)) from exc
     except Exception as exc:
         raise sto.OriginExportError(f"Origin project export failed: {exc}") from exc
     finally:
-        # Never leave Origin holding the temporary candidate before it is renamed.
-        sto.close_origin_app(op, started=True)
-        sto._cleanup_origin_temp_dirs(pending_cleanup)
+        session.close()
+
+
+def _populate_origin_project(
+    op,
+    tables: tuple[PlannedTable, ...],
+    converted: list[list[list[Any]]],
+    conversion_notes: list[list[str]] | None = None,
+):
+    """Replace the current Origin project with these tables. ``op.new`` returns None."""
+    sto = _origin_support()
+    op.new(False)
+    books = list(op.pages("w"))
+    if not books:
+        raise sto.OriginExportError("Origin did not create a workbook")
+    book = books[0]
+    book.lname = "Imported Data"
+    for extra in books[1:]:
+        extra.destroy()
+    for key in ("g", "m"):
+        try:
+            leftovers = list(op.pages(key))
+        except Exception:
+            leftovers = []
+        for page in leftovers:
+            destroy = getattr(page, "destroy", None)
+            if callable(destroy):
+                destroy()
+    if list(op.pages("g")):
+        raise sto.OriginExportError("Origin still had graph pages after starting a new project")
+
+    short_names = _output_sheet_names(tables, "opju") + [_origin_provenance_sheet_name(tables)]
+    data_sheets = []
+    graph_pages = []
+    for index, (planned, short_name) in enumerate(zip(tables, short_names[:-1])):
+        sheet = book[0] if index == 0 else book.add_sheet(short_name)
+        sheet.name = short_name
+        sheet.lname = planned.name
+        _fill_origin_sheet(op, sheet, planned, converted[index])
+        data_sheets.append(sheet)
+        if planned.plot.kind != "none":
+            graph_pages.append(_plot_origin_table(op, sheet, planned))
+
+    provenance = book.add_sheet(short_names[-1])
+    provenance.name = short_names[-1]
+    provenance.lname = "Import Provenance"
+    _fill_origin_provenance(provenance, tables, conversion_notes)
+    _verify_origin_project(op, data_sheets, graph_pages, tables, converted)
+    return data_sheets, graph_pages
 
 
 def _show_installed_origin(path: Path) -> str | None:
@@ -430,13 +567,13 @@ def _show_installed_origin(path: Path) -> str | None:
         return f"The .opju was saved, but Origin could not remain open: {exc}"
 
 
-def _fill_origin_sheet(op, sheet, planned: PlannedTable) -> None:
+def _fill_origin_sheet(op, sheet, planned: PlannedTable, column_values: list[list[Any]]) -> None:
     table = planned.table
     sheet.cols = len(table.columns)
     formats = _origin_format_codes()
     dso = _origin_dso(op) if any(column.kind == "datetime" for column in table.columns) else None
     for index, column in enumerate(table.columns):
-        values = _coerce_column(column, planned.name)
+        values = list(column_values[index])
         if column.kind in {"number", "datetime"}:
             if column.kind == "datetime":
                 values = [float("nan") if value is None else _origin_date_number(value, dso) for value in values]
@@ -497,8 +634,12 @@ def _plot_origin_table(op, sheet, planned: PlannedTable):
     return graph
 
 
-def _fill_origin_provenance(sheet, tables: tuple[PlannedTable, ...]) -> None:
-    rows = [tuple(_PROVENANCE_HEADERS), *_provenance_rows(tables, "opju")]
+def _fill_origin_provenance(
+    sheet,
+    tables: tuple[PlannedTable, ...],
+    conversion_notes: list[list[str]] | None = None,
+) -> None:
+    rows = [tuple(_PROVENANCE_HEADERS), *_provenance_rows(tables, "opju", conversion_notes)]
     columns = list(zip(*rows))
     formats = _origin_format_codes()
     sheet.cols = len(_PROVENANCE_HEADERS)
@@ -508,7 +649,13 @@ def _fill_origin_provenance(sheet, tables: tuple[PlannedTable, ...]) -> None:
     sheet.cols_axis()
 
 
-def _verify_origin_project(op, sheets, graphs, tables: tuple[PlannedTable, ...]) -> None:
+def _verify_origin_project(
+    op,
+    sheets,
+    graphs,
+    tables: tuple[PlannedTable, ...],
+    converted: list[list[list[Any]]],
+) -> None:
     if len(sheets) != len(tables):
         raise _origin_error_type()(f"Origin workbook has {len(sheets)} data sheets; expected {len(tables)}")
     expected_graphs = sum(item.plot.kind != "none" for item in tables)
@@ -516,7 +663,7 @@ def _verify_origin_project(op, sheets, graphs, tables: tuple[PlannedTable, ...])
         raise _origin_error_type()(f"Origin project has {len(graphs)} graphs; expected {expected_graphs}")
     dso = _origin_dso(op) if any(col.kind == "datetime" for item in tables for col in item.table.columns) else 0
     graph_index = 0
-    for sheet, planned in zip(sheets, tables):
+    for table_index, (sheet, planned) in enumerate(zip(sheets, tables)):
         table = planned.table
         if sheet.cols != len(table.columns):
             raise _origin_error_type()(f"Wrong column count after Origin import: {planned.name}")
@@ -524,7 +671,7 @@ def _verify_origin_project(op, sheets, graphs, tables: tuple[PlannedTable, ...])
             raise _origin_error_type()(f"Wrong row count after Origin import: {planned.name}")
         for column_index, column in enumerate(table.columns):
             actual = sheet.to_list(column_index)
-            expected = _coerce_column(column, planned.name)
+            expected = list(converted[table_index][column_index])
             if column.kind == "datetime":
                 expected = [float("nan") if value is None else _origin_date_number(value, dso) for value in expected]
             elif column.kind == "number":
@@ -675,80 +822,27 @@ def _table_receipt(planned: PlannedTable, output_sheet: str, output_format: str)
     }
 
 
-def _all_warnings(prepared: PreparedImport, tables: tuple[PlannedTable, ...]) -> list[str]:
+def _all_warnings(
+    prepared: PreparedImport,
+    tables: tuple[PlannedTable, ...],
+    conversion_warnings: list[str] | None = None,
+) -> list[str]:
     warnings = list(prepared.warnings)
     for planned in tables:
         warnings.extend(planned.table.warnings)
-        warnings.extend(_table_conversion_warnings(planned, prepared.format))
+    if conversion_warnings is None:
+        for planned in tables:
+            warnings.extend(_table_conversion_warnings(planned, prepared.format))
+    else:
+        warnings.extend(conversion_warnings)
     return list(dict.fromkeys(str(item) for item in warnings if str(item).strip()))
 
 
 def _table_conversion_warnings(planned: PlannedTable, output_format: str) -> list[str]:
     warnings: list[str] = []
     for column in planned.table.columns:
-        if column.kind == "text" and output_format == "xlsx":
-            empty_strings = sum(value == "" for value in column.values)
-            if empty_strings:
-                warnings.append(
-                    f"{planned.name}/{column.name}: {empty_strings} empty string(s) are written as blank XLSX cells "
-                    "and may read back as missing values"
-                )
-        elif column.kind == "number":
-            rounded: list[tuple[str, float]] = []
-            for raw in column.values:
-                if raw is None:
-                    continue
-                exact = Decimal(raw.strip().replace("d", "e").replace("D", "E"))
-                value = float(exact)
-                if exact.is_finite() and math.isfinite(value) and Decimal(str(value)) != exact:
-                    rounded.append((raw, value))
-            if rounded:
-                raw, value = rounded[0]
-                warnings.append(
-                    f"{planned.name}/{column.name}: {len(rounded)} numeric value(s) were rounded "
-                    f"to binary64; example {raw!r} -> {value!r}"
-                )
-        elif column.kind == "datetime":
-            aware = 0
-            naive = 0
-            xlsx_submillisecond = 0
-            origin_submicrosecond = 0
-            for row_index, raw in enumerate(column.values, start=1):
-                if raw is None:
-                    continue
-                parsed = _parse_datetime(raw, planned.name, column.name, row_index)
-                if parsed.utcoffset() is None:
-                    naive += 1
-                else:
-                    aware += 1
-                fraction = re.search(r"[Tt ]\d{2}:\d{2}:\d{2}\.(\d+)", raw)
-                if fraction:
-                    digits = fraction.group(1)
-                    if output_format == "xlsx" and len(digits) > 3 and any(digit != "0" for digit in digits[3:]):
-                        xlsx_submillisecond += 1
-                    if output_format == "opju" and len(digits) > 6 and any(digit != "0" for digit in digits[6:]):
-                        origin_submicrosecond += 1
-            if aware:
-                if naive:
-                    warnings.append(
-                        f"{planned.name}/{column.name}: mixed naive and timezone-aware timestamps; "
-                        f"{aware} aware value(s) converted to UTC and {naive} naive value(s) retained"
-                    )
-                else:
-                    warnings.append(
-                        f"{planned.name}/{column.name}: {aware} timezone-aware timestamp(s) converted to UTC; "
-                        "the Origin date column does not store the original timezone"
-                    )
-            if xlsx_submillisecond:
-                warnings.append(
-                    f"{planned.name}/{column.name}: {xlsx_submillisecond} timestamp(s) have precision finer than "
-                    "milliseconds; XLSX native date cells store milliseconds"
-                )
-            if origin_submicrosecond:
-                warnings.append(
-                    f"{planned.name}/{column.name}: {origin_submicrosecond} timestamp(s) have precision finer than "
-                    "microseconds; Origin date values are limited by datetime parsing and serial-number precision"
-                )
+        _values, notes = _convert_column(column, planned.name, output_format)
+        warnings.extend(notes)
     return warnings
 
 
@@ -823,6 +917,42 @@ class _OriginExportLock:
 
 def _origin_export_lock() -> _OriginExportLock:
     return _OriginExportLock()
+
+
+_export_gate = threading.Lock()
+_export_local = threading.local()
+
+
+class origin_export_lock:
+    """Reentrant per-thread, exclusive across threads and processes.
+
+    The file lock is the one old entry points already take. A second acquire on
+    the same thread nests. Another thread or process gets the existing
+    "already active" error instead of attaching to the same Origin session.
+    """
+
+    def __enter__(self):
+        depth = getattr(_export_local, "depth", 0)
+        if depth == 0:
+            _export_gate.acquire()
+            lock = _origin_export_lock()
+            try:
+                lock.__enter__()
+            except BaseException:
+                _export_gate.release()
+                raise
+            _export_local.lock = lock
+        _export_local.depth = depth + 1
+        return self
+
+    def __exit__(self, exc_type, exc, traceback) -> None:
+        _export_local.depth -= 1
+        if _export_local.depth == 0:
+            try:
+                _export_local.lock.__exit__(exc_type, exc, traceback)
+            finally:
+                _export_local.lock = None
+                _export_gate.release()
 
 
 def _install_staged_file(staged: Path, destination: Path, *, overwrite: bool) -> None:

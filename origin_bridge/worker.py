@@ -23,6 +23,45 @@ def execute_import_request(plan: dict[str, Any], base_dir: str | Path | None = N
         return {"ok": False, "error": str(exc) or exc.__class__.__name__}
 
 
+def execute_batch_request(
+    request: dict[str, Any],
+    cancel_event: Any = None,
+    progress: Any = None,
+) -> dict[str, Any]:
+    """Run a batch request in-process. ``cancel_event`` is any object with ``is_set()``."""
+    from .batch import execute_batch
+
+    return execute_batch(request, cancel_event=cancel_event, progress=progress)
+
+
+def batch_worker(send_conn, request: dict[str, Any], cancel_event: Any = None) -> None:
+    """Windows-spawn entry. Pass a multiprocessing.Event as ``cancel_event``.
+
+    Progress events are ``{"type": "progress", "event": {...}}``. The final
+    message is ``{"type": "result", "result": {...}}``. The request itself must
+    stay JSON-safe; the cancel event is a separate spawn argument.
+    """
+    def progress(event: dict[str, Any]) -> None:
+        try:
+            send_conn.send({"type": "progress", "event": event})
+        except (BrokenPipeError, EOFError, OSError):
+            pass
+
+    try:
+        result = execute_batch_request(request, cancel_event=cancel_event, progress=progress)
+        send_conn.send({"type": "result", "result": result})
+    except BaseException as exc:
+        try:
+            send_conn.send({"type": "result", "result": {"ok": False, "error": str(exc) or exc.__class__.__name__}})
+        except (BrokenPipeError, EOFError, OSError):
+            pass
+    finally:
+        try:
+            send_conn.close()
+        except OSError:
+            pass
+
+
 def import_worker(send_conn, plan: dict[str, Any], base_dir: str | Path | None = None) -> None:
     """Multiprocessing entry point; keep at module scope for Windows spawn."""
     try:

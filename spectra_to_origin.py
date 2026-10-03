@@ -956,7 +956,29 @@ def build_export_tables(
     return [build_table(spec.name, list(spec.spectra), spec.layout, axis_labels) for spec in specs]
 
 
+def _with_shared_export_lock():
+    from origin_bridge.exporter import origin_export_lock
+
+    return origin_export_lock()
+
+
 def export_spectra(
+    files: list[Path],
+    output_xlsx: Path,
+    layout: str = "auto",
+    split_temp: bool = False,
+    n_groups: int | None = None,
+    groups: list[tuple[str, list[Spectrum]]] | None = None,
+    write_csv_copy: bool = True,
+    axis_labels: AxisLabels = AxisLabels(),
+) -> tuple[Path, Path | None]:
+    with _with_shared_export_lock():
+        return _export_spectra_locked(
+            files, output_xlsx, layout, split_temp, n_groups, groups, write_csv_copy, axis_labels,
+        )
+
+
+def _export_spectra_locked(
     files: list[Path],
     output_xlsx: Path,
     layout: str = "auto",
@@ -1222,6 +1244,23 @@ def write_origin_project(
     keep_open: bool = False,
     axis_labels: AxisLabels = AxisLabels(),
 ) -> Path:
+    with _with_shared_export_lock():
+        return _write_origin_project_locked(
+            spectra, output_opju, layout, split_temp, n_groups, groups, show_origin, keep_open, axis_labels,
+        )
+
+
+def _write_origin_project_locked(
+    spectra: list[Spectrum],
+    output_opju: Path,
+    layout: str = "auto",
+    split_temp: bool = False,
+    n_groups: int | None = None,
+    groups: list[tuple[str, list[Spectrum]]] | None = None,
+    show_origin: bool = False,
+    keep_open: bool = False,
+    axis_labels: AxisLabels = AxisLabels(),
+) -> Path:
     if not spectra:
         raise ValueError("没有谱线")
     resolved_groups = resolve_groups(spectra, groups=groups, split_temp=split_temp, n_groups=n_groups)
@@ -1286,6 +1325,24 @@ def write_origin_project(
 
 
 def export_origin_project(
+    files: list[Path],
+    output_opju: Path,
+    layout: str = "auto",
+    split_temp: bool = False,
+    n_groups: int | None = None,
+    groups: list[tuple[str, list[Spectrum]]] | None = None,
+    show_origin: bool = False,
+    keep_open: bool = False,
+    also_xlsx: bool = False,
+    axis_labels: AxisLabels = AxisLabels(),
+) -> tuple[Path, Path | None, Path | None]:
+    with _with_shared_export_lock():
+        return _export_origin_project_locked(
+            files, output_opju, layout, split_temp, n_groups, groups, show_origin, keep_open, also_xlsx, axis_labels,
+        )
+
+
+def _export_origin_project_locked(
     files: list[Path],
     output_opju: Path,
     layout: str = "auto",

@@ -238,8 +238,8 @@ class GenericExporterTests(unittest.TestCase):
         output = self.root / "race.xlsx"
         original_writer = exporter._write_xlsx
 
-        def writer(stage, tables):
-            original_writer(stage, tables)
+        def writer(stage, tables, *args, **kwargs):
+            original_writer(stage, tables, *args, **kwargs)
             output.write_bytes(b"external writer owns this")
 
         with mock.patch.object(exporter, "_write_xlsx", side_effect=writer):

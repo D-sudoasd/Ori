@@ -110,6 +110,8 @@ py -3 -m origin_bridge import -i .\examples_general\categories.json `
 
 计划默认不覆盖已有文件；如要替换，需要明确传入 `--overwrite`。绘图可用 `--plot auto|none|line|scatter|line_symbol|column`，并用 `--x 列名` 和 `--y 列名 ...` 选择图形列。误差列映射在导入计划中设置。可用 `--header auto|yes|no`、`--skip-rows N`、`--delimiter auto|whitespace|tab|,|;` 和 `--sheet 工作表名` 处理来源格式。Excel 省略 `--sheet` 时读取所有非空工作表。运行 `py -3 -m origin_bridge --help` 或在子命令后添加 `--help` 查看完整选项。
 
+`batch` 子命令为每个输入文件写一个输出，并把续跑记录放在输出目录的 `batch-record.json`。`--resume` 只在源内容、读取设置、绘图设置、输出路径和输出字节都未变时跳过；文件存在或修改时间相同不会单独构成跳过条件。签名、JSON 示例、取消、重试和 PDF 约定见 [docs/batch-api.md](docs/batch-api.md)。
+
 需要 agent 通过 MCP 直接操作时，安装可选依赖并在 MCP 客户端中将项目目录设为工作目录、启动 `python -m origin_bridge.mcp_server`：
 
 ```powershell

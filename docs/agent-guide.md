@@ -75,6 +75,13 @@ py -3 -m origin_bridge import `
   --plot none
 ```
 
+按文件批量导出使用 `batch`。每个输入文件生成一个 OPJU 或 XLSX；同一 Excel 工作簿的非空工作表进入同一个输出。默认不覆盖已有文件，并用 `batch-record.json` 记录可续跑的任务。完整请求、结果、进度、取消、重试和续跑约定见 [batch-api.md](batch-api.md)。
+
+```powershell
+py -3 -m origin_bridge batch -i .\examples_general -o .\out\batch --format xlsx --plot none
+py -3 -m origin_bridge batch -i .\examples_general -o .\out\batch --resume
+```
+
 计划命令只创建 JSON 计划，`import` 命令直接执行。CLI 的 `plan --save` 不覆盖已有计划文件；导入目标默认不覆盖，只有指定 `--overwrite` 才允许替换。计划文件中的相对源路径由 `validate` 和 `execute` 按计划文件所在目录解析；自动生成的计划通常记录源文件绝对路径。
 
 CLI 可通过 `--plot auto|none|line|scatter|line_symbol|column` 指定图形，通过 `--x 列名` 和 `--y 列名 ...` 选择列。Y 误差列需在保存的计划 JSON 中设置 `plot.y_error`，或直接编辑 MCP 返回的计划对象，然后调用 `validate_import_plan`。

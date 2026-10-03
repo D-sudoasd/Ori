@@ -43,6 +43,36 @@ def build_parser() -> argparse.ArgumentParser:
     for command in ("validate", "execute"):
         sub = subs.add_parser(command)
         sub.add_argument("plan", help="导入计划 JSON 文件，相对源路径以计划所在目录为基准")
+    batch = subs.add_parser("batch", help="按文件批量导出；每个输入文件一个 OPJU 或 XLSX")
+    batch.add_argument("-i", "--input", nargs="+", required=True, help="文件或目录，可多个")
+    batch.add_argument("--header", choices=("auto", "yes", "no"), default="auto")
+    batch.add_argument("--skip-rows", type=int, default=0)
+    batch.add_argument("--sheet", help="Excel 工作表名；省略时读取全部非空表")
+    batch.add_argument("--delimiter", choices=("auto", "whitespace", "tab", ",", ";"), default="auto")
+    batch.add_argument("--encoding", default="auto")
+    batch.add_argument("--missing-value", action="append", help="额外的缺失值标记；默认仅空值")
+    batch.add_argument("--formula-policy", choices=("cached", "text"), default="cached")
+    batch.add_argument("-o", "--output-dir", required=True, help="批量输出目录")
+    batch.add_argument("--layout", choices=("per_file", "unified"), default="per_file",
+                       help="per_file：每个输入一个文件；unified：旧的单工程导出")
+    batch.add_argument("--format", choices=("opju", "xlsx"), default="opju")
+    batch.add_argument("--overwrite", action="store_true", help="允许替换已有输出文件")
+    batch.add_argument("--keep-open", action="store_true", help="保存后保持本次 Origin 会话打开")
+    batch.add_argument("--plot", choices=("auto", "none", "line", "scatter", "line_symbol", "column"), default="auto")
+    batch.add_argument("--x", help="X 列的原始唯一列名或从 0 开始的列号；不填时使用建议映射")
+    batch.add_argument("--y", nargs="+", help="Y 列的原始唯一列名或从 0 开始的列号")
+    batch.add_argument("--pdf", action="store_true", help="为每个 Origin 图形另存一份矢量 PDF")
+    batch.add_argument("--resume", action="store_true", help="按记录续跑；源、配置或输出变化不会只因文件存在而跳过")
+    batch.add_argument("--record", help="任务记录 JSON；默认是输出目录中的 batch-record.json")
+    batch.add_argument("--recycle-every", type=int, default=0, help="每完成 N 个 OPJU 后重启 Origin；0 表示不按文件重启")
+    batch.add_argument("--prefetch", type=int, default=1, help="当前任务之外预先解析的任务数")
+    batch.add_argument("--max-resident", dest="max_resident_tasks", type=int, default=2,
+                       help="同时保留的完整任务数，含当前任务")
+    batch.add_argument("--origin-timeout", dest="origin_timeout_s", type=float, default=300)
+    batch.add_argument("--origin-retries", type=int, default=1, help="Origin 会话丢失后的额外尝试次数")
+    batch.add_argument("--output-name", help="仅 unified 布局使用的输出文件名")
+    batch.add_argument("--retry-failed", action="store_true",
+                       help="续跑并丢掉失败、取消和阻塞记录，使这些任务再次执行")
     return parser
 
 
@@ -61,7 +91,63 @@ def _read_options(args: argparse.Namespace) -> dict:
     return options
 
 
+def _batch_plot(args: argparse.Namespace) -> dict | None:
+    plot: dict = {}
+    if args.plot != "auto":
+        plot["kind"] = args.plot
+    if args.plot == "none":
+        plot.update(x=None, y=[], y_error={})
+    else:
+        if args.x is not None:
+            plot["x"] = _column_selector(args.x)
+        if args.y is not None:
+            plot["y"] = [_column_selector(item) for item in args.y]
+    return plot or None
+
+
+def _column_selector(value: str):
+    token = value.strip()
+    if token.isdecimal():
+        return int(token)
+    return value
+
+
+def _run_batch(args: argparse.Namespace) -> dict:
+    from .batch import build_batch_request, execute_batch, load_batch_record
+
+    request = build_batch_request(
+        [Path(item) for item in args.input],
+        Path(args.output_dir),
+        layout=args.layout,
+        format=args.format,
+        read_options=_read_options(args),
+        plot=_batch_plot(args),
+        overwrite=args.overwrite,
+        pdf=args.pdf,
+        keep_open=args.keep_open,
+        recycle_every=args.recycle_every,
+        prefetch=args.prefetch,
+        max_resident_tasks=args.max_resident_tasks,
+        origin_timeout_s=args.origin_timeout_s,
+        origin_retries=args.origin_retries,
+        output_name=args.output_name,
+        record_path=args.record,
+        resume=bool(args.resume or args.retry_failed),
+    )
+    if args.retry_failed:
+        record = load_batch_record(request["record_path"])
+        request["retry_task_ids"] = [
+            task_id
+            for task_id, task in dict(record.get("tasks") or {}).items()
+            if task.get("status") in {"failed", "cancelled", "blocked"}
+        ]
+        request["resume"] = True
+    return execute_batch(request)
+
+
 def _dispatch(args: argparse.Namespace) -> dict:
+    if args.command == "batch":
+        return _run_batch(args)
     from .planning import create_plan, describe_prepared, inspect_inputs, prepare_plan
 
     if args.command in ("validate", "execute"):
@@ -115,6 +201,8 @@ def main(argv: list[str] | None = None) -> int:
         with contextlib.redirect_stdout(sys.stderr):
             result = _dispatch(args)
         code = 0
+        if args.command == "batch" and not result.get("ok", False):
+            code = 4
     except Exception as exc:
         result = {"ok": False, "error": {"type": type(exc).__name__, "message": str(exc)}}
         code = 4

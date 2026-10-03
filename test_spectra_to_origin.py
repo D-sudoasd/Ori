@@ -309,13 +309,11 @@ class BulkCliTests(unittest.TestCase):
             self.skipTest("Origin is already running; preserve the user's session")
         n_files = 48
         tool = Path(sto.__file__).resolve()
-        dest_dir = tool.parent / "_test_out"
-        dest_dir.mkdir(parents=True, exist_ok=True)
-        opju = dest_dir / "bulk.opju"
-        if opju.exists():
-            opju.unlink()
-        with tempfile.TemporaryDirectory() as raw:
-            folder = Path(raw).resolve() / "spectra"
+        # One combined workbook, written outside the repository so `_test_out` is not touched.
+        with tempfile.TemporaryDirectory(prefix="ori_bulk_") as raw:
+            root = Path(raw).resolve()
+            opju = root / "bulk.opju"
+            folder = root / "spectra"
             folder.mkdir()
             stems = []
             for index in range(n_files):
