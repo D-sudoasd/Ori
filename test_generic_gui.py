@@ -288,12 +288,14 @@ class GenericGuiContractTests(unittest.TestCase):
             plan_path = plan_folder / "signal_plan.json"
             output = folder / "signal_result.xlsx"
             try:
-                app = GeneralDataApp([source])
+                app = GeneralDataApp()
             except tk.TclError as exc:
                 self.skipTest(f"Tk display is unavailable: {exc}")
             process = None
             try:
                 app.root.withdraw()
+                _use_unified(app)
+                app._add_paths([source])
                 deadline = time.monotonic() + 15
                 while app._busy and time.monotonic() < deadline:
                     app.root.update()
@@ -670,6 +672,11 @@ class ImportPollBudgetTests(unittest.TestCase):
         self.assertFalse(app._busy)
 
 
+def _use_unified(app) -> None:
+    """Legacy single-project tests inspect every source. The default mode does not."""
+    app.layout_var.set("unified")
+
+
 def _pump(app, seconds: float) -> None:
     deadline = time.monotonic() + seconds
     while app._busy and time.monotonic() < deadline:
@@ -717,6 +724,7 @@ class RealTkSourcePerformanceTests(unittest.TestCase):
                 self.skipTest(f"Tk display is unavailable: {exc}")
             try:
                 app.root.withdraw()
+                _use_unified(app)
                 with mock.patch.object(gui.messagebox, "showerror") as showerror:
                     app._add_paths([folder / "missing.csv"])
                     _pump(app, 10)
@@ -819,6 +827,7 @@ class RealTkSourcePerformanceTests(unittest.TestCase):
 
             try:
                 app.root.withdraw()
+                _use_unified(app)
                 warmup = time.monotonic() + 0.5
                 while time.monotonic() < warmup:
                     app.root.update()
@@ -1202,6 +1211,7 @@ class RealTkSourceRepairTests(unittest.TestCase):
                 self.skipTest(f"Tk display is unavailable: {exc}")
             try:
                 app.root.withdraw()
+                _use_unified(app)
                 with (
                     mock.patch.object(gui.messagebox, "showerror") as showerror,
                     mock.patch.object(app, "_inspect_paths_worker", side_effect=RuntimeError("inspect boom")),
@@ -1246,6 +1256,7 @@ class RealTkSourceRepairTests(unittest.TestCase):
             thread = None
             try:
                 app.root.withdraw()
+                _use_unified(app)
                 app.root.report_callback_exception = lambda *args: errors.append(args)
                 with mock.patch.object(app, "_inspect_paths_worker", block):
                     app._add_paths([source])
@@ -1391,6 +1402,7 @@ class RealTkSourceRepairTests(unittest.TestCase):
                 self.skipTest(f"Tk display is unavailable: {exc}")
             try:
                 app.root.withdraw()
+                _use_unified(app)
                 app._add_paths([good])
                 _pump(app, 15)
                 app.title_var.set("KEEP TITLE")
@@ -1482,6 +1494,7 @@ class RealTkSourceRepairTests(unittest.TestCase):
                 self.skipTest(f"Tk display is unavailable: {exc}")
             try:
                 app.root.withdraw()
+                _use_unified(app)
                 app._add_paths([companion, workbook_path])
                 _pump(app, 20)
                 sheets = [values[1] for _iid, values in _tree_rows(app) if Path(values[0]).name == "book.xlsx"]

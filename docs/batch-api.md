@@ -1,6 +1,10 @@
 # 批量导出 API
 
-批量核心在 `origin_bridge.batch`。GUI 下一阶段只调用这里的 JSON 安全请求和 `origin_bridge.worker.batch_worker`，不要在 Tk 里启动 Origin，也不要改 `origin_bridge/gui.py`。
+批量核心在 `origin_bridge.batch`。通用数据窗口调用 JSON 安全的 `build_batch_request` 和 `origin_bridge.worker.batch_worker`，取消事件单独作为 spawn 参数。不要在 Tk 线程里启动 Origin。
+
+核心审查阶段曾经要求不要改 `origin_bridge/gui.py`。那只约束当时的核心补丁。批量窗口可以修改 GUI。窗口把可恢复的完整请求写到输出目录的 `batch-config.json`（名称、`record_path`、输入路径和请求本体），不改核心成功回执。只有 `batch-record.json` 时不能凭窗口当前默认值重新导出。
+
+“停止后续”只在任务之间生效：当前这项会跑完，后面的任务取消。它不能打断还没证明归属的 Origin 启动；那种 COM 调用可能一直不返回，此时没有可以安全结束的进程。
 
 `session_factory`、进程内 `progress` 回调和 `cancel_event` 不是 JSON 字段。跨进程时请求本体必须能 `json.dumps`，取消事件单独作为 spawn 参数传入。
 

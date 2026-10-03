@@ -13,6 +13,13 @@ hiddenimports = [
     "originpro",
     "openpyxl",
     "xlrd",
+    "origin_bridge.batch",
+    "origin_bridge.session",
+    "origin_bridge.worker",
+    "origin_bridge.gui",
+    "origin_bridge.gui_drive",
+    "origin_bridge.batch_config",
+    "origin_bridge.source_summary",
 ]
 for package in ("originpro", "OriginExt", "openpyxl", "xlrd"):
     pkg_datas, pkg_binaries, pkg_hidden = collect_all(package)

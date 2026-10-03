@@ -7,6 +7,7 @@ import json
 import multiprocessing
 import os
 import queue
+import re
 import subprocess
 import sys
 import threading
@@ -17,9 +18,15 @@ from tkinter import filedialog, messagebox, ttk
 import tkinter as tk
 from typing import Any
 
+from .batch_config import (
+    config_path_for,
+    find_config_for_record,
+    load_batch_config,
+    save_batch_config,
+)
 from .readers import SUPPORTED_EXTENSIONS, _natural_key, discover_files
 from .source_summary import SummaryStore, options_fingerprint
-from .worker import import_worker
+from .worker import batch_worker, import_worker
 
 
 SUPPORTED_SUFFIXES = SUPPORTED_EXTENSIONS
@@ -85,6 +92,106 @@ def _read_options(header: str, skip_rows: str | int, delimiter: str) -> dict[str
 def _job_error_text(exc: BaseException) -> str:
     detail = str(exc).strip() or exc.__class__.__name__
     return f"读取来源失败：{detail}"
+
+
+def _column_token(text: str) -> str | int:
+    """All digits are a zero-based column index. Any other token is a column name."""
+    token = text.strip()
+    if re.fullmatch(r"\d+", token):
+        return int(token)
+    return token
+
+
+def build_global_plot(*, scope: str, kind: str, explicit_x: str, explicit_y: str, explicit_error: str) -> dict[str, Any]:
+    """Plot request applied to every file and every sheet.
+
+    ``auto`` leaves column choice to each table's own suggestion. Explicit
+    tokens are passed through unchanged so a missing column fails that job
+    instead of being replaced by the preview's suggestion.
+    """
+    plot_kind = kind or "auto"
+    if plot_kind not in {"auto", "none", "line", "scatter", "line_symbol", "column"}:
+        raise ValueError(f"不支持的图形类型：{plot_kind}")
+    if scope not in {"explicit", "明确列"}:
+        return {
+            "kind": plot_kind,
+            "x": "auto",
+            "y": "auto",
+            "y_error": "auto",
+            "title": "auto",
+            "x_label": "auto",
+            "y_label": "auto",
+        }
+    y_tokens = [part.strip() for part in explicit_y.replace("，", ",").replace(";", ",").split(",")]
+    y_tokens = [part for part in y_tokens if part]
+    if plot_kind == "none":
+        y_values: list[Any] = []
+    elif not y_tokens:
+        raise ValueError("明确列需要至少一个 Y 列名或从 0 开始的列号。全数字按列号，其余按列名。")
+    else:
+        y_values = [_column_token(part) for part in y_tokens]
+    x_text = explicit_x.strip()
+    plot: dict[str, Any] = {
+        "kind": plot_kind,
+        "x": _column_token(x_text) if x_text else "auto",
+        "y": y_values,
+        "y_error": {},
+        "title": "auto",
+        "x_label": "auto",
+        "y_label": "auto",
+    }
+    error_text = explicit_error.strip()
+    if error_text:
+        if len(y_tokens) != 1:
+            raise ValueError("误差列只在明确选择了单个 Y 列时可用。")
+        plot["y_error"] = {y_tokens[0]: _column_token(error_text)}
+    return plot
+
+
+def _format_task_status(event: dict[str, Any]) -> str:
+    labels = {
+        "succeeded": "成功",
+        "failed": "失败",
+        "cancelled": "已取消",
+        "blocked": "已阻塞",
+        "skipped": "已跳过",
+    }
+    text = labels.get(str(event.get("status") or ""), str(event.get("status") or ""))
+    if event.get("pdf_status") == "failed":
+        text += "（PDF 失败）"
+    return text
+
+
+def _format_task_detail(event: dict[str, Any]) -> str:
+    parts: list[str] = []
+    error = event.get("error")
+    if isinstance(error, dict):
+        message = str(error.get("message") or error.get("type") or "").strip()
+        if message:
+            parts.append(message)
+    elif error:
+        parts.append(str(error))
+    for item in event.get("pdf_errors") or []:
+        if not isinstance(item, dict):
+            parts.append(str(item))
+            continue
+        name = item.get("graph") or item.get("table") or item.get("short_name") or "图"
+        reason = item.get("message") or "PDF 失败"
+        parts.append(f"{name}: {reason}")
+    if event.get("pdf_status") == "failed" and not parts:
+        parts.append("PDF 失败")
+    return "；".join(parts)
+
+
+def _format_batch_counts(counts: dict[str, Any]) -> str:
+    return (
+        f"成功 {int(counts.get('succeeded') or 0)}，"
+        f"跳过 {int(counts.get('skipped') or 0)}，"
+        f"失败 {int(counts.get('failed') or 0)}，"
+        f"取消 {int(counts.get('cancelled') or 0)}，"
+        f"阻塞 {int(counts.get('blocked') or 0)}，"
+        f"PDF 失败 {int(counts.get('pdf_failed') or 0)}"
+    )
 
 
 _REPARSE_POINT = 0x400
@@ -297,7 +404,7 @@ class GeneralDataApp:
     def __init__(self, initial_files: list[Path] | None = None) -> None:
         self.root = tk.Tk()
         self.root.title("数据 → Origin 工程")
-        self.root.minsize(1020, 760)
+        self.root.minsize(1100, 860)
 
         self._paths: list[Path] = []
         self._path_keys: list[str] = []
@@ -316,14 +423,23 @@ class GeneralDataApp:
         self._thread_kind: str | None = None
         self._import_process = None
         self._import_recv = None
+        self._import_cancel = None
+        self._import_kind: str | None = None
         self._import_result: dict[str, Any] | None = None
         self._import_exit_waits = 0
         self._import_eof = False
+        self._saved_request: dict[str, Any] | None = None
+        self._after_list = None
+        self._task_iids: dict[str, str] = {}
+        self._task_seq = 0
+        self._batch_terminal = False
         self._summaries = SummaryStore()
         self._source_errors: dict[str, str] = {}
         self._fingerprints: dict[tuple[str, str | None], tuple[Any, str]] = {}
         self._iids_by_path: dict[str, list[str]] = {}
         self._pending_outcomes: deque[tuple[dict[str, Any], str]] = deque()
+        self._pending_listed: deque[dict[str, Any]] = deque()
+        self._suppress_preview = False
         self._job_terminal = False
         self._job_error: str | None = None
         self._done_message: dict[str, Any] | None = None
@@ -347,12 +463,24 @@ class GeneralDataApp:
         self.y_label_var = tk.StringVar()
         self.format_var = tk.StringVar(value="opju")
         self.keep_open_var = tk.BooleanVar(value=False)
-        self.status_var = tk.StringVar(value="添加文件或文件夹后，先检查预览，再选择图形和输出格式。")
+        self.layout_var = tk.StringVar(value="per_file")
+        self.pdf_var = tk.BooleanVar(value=False)
+        self.batch_overwrite_var = tk.BooleanVar(value=False)
+        self.plot_scope_var = tk.StringVar(value="自动（按每张表建议）")
+        self.batch_kind_var = tk.StringVar(value="auto")
+        self.explicit_x_var = tk.StringVar()
+        self.explicit_y_var = tk.StringVar()
+        self.explicit_error_var = tk.StringVar()
+        self.batch_name_var = tk.StringVar()
+        self.status_var = tk.StringVar(
+            value="默认每个来源一个文件。添加后只发现路径；预览选中的来源。合并模式才会逐个检查全部来源。"
+        )
 
         self._build()
         self.root.protocol("WM_DELETE_WINDOW", self._on_close)
         self._guard_destroy()
         self._hook_after = self.root.after(200, self._hook_drop)
+        self._schedule_drive()
         if initial_files:
             self._add_paths(initial_files, announce=False)
 
@@ -404,6 +532,7 @@ class GeneralDataApp:
         self.table_tree.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
         source_scroll.pack(side=tk.RIGHT, fill=tk.Y)
         self.table_tree.bind("<<TreeviewSelect>>", self._on_table_selection)
+        self.table_tree.bind("<Double-1>", lambda _event: self.preview_selected())
 
         read_frame = ttk.LabelFrame(outer, text="读取选项", padding=(7, 5))
         read_frame.pack(fill=tk.X, pady=(7, 0))
@@ -441,7 +570,7 @@ class GeneralDataApp:
         sample_frame.rowconfigure(0, weight=1)
         sample_frame.columnconfigure(0, weight=1)
 
-        plot_box = ttk.LabelFrame(outer, text="当前表的绘图设置", padding=(7, 5))
+        plot_box = ttk.LabelFrame(outer, text="当前表的绘图设置（仅“合并为一个工程”时写入计划）", padding=(7, 5))
         plot_box.pack(fill=tk.X, pady=(7, 0))
         row = ttk.Frame(plot_box)
         row.pack(fill=tk.X)
@@ -468,26 +597,100 @@ class GeneralDataApp:
             ttk.Label(label_row, text=label).pack(side=tk.LEFT)
             self._track(ttk.Entry(label_row, textvariable=var, width=width)).pack(side=tk.LEFT, padx=(4, 12))
 
+        batch_box = ttk.LabelFrame(outer, text="批量绘图与输出", padding=(7, 5))
+        batch_box.pack(fill=tk.X, pady=(7, 0))
+        scope = ttk.Label(
+            batch_box,
+            text="生效范围：每一个文件、每一张表。自动按每张表自己的建议；明确列对不上时该文件失败，不会改用预览里的其他列。全数字按列号。",
+            wraplength=1040,
+            justify=tk.LEFT,
+        )
+        scope.pack(fill=tk.X)
+        batch_row = ttk.Frame(batch_box)
+        batch_row.pack(fill=tk.X, pady=(4, 0))
+        ttk.Label(batch_row, text="列选择").pack(side=tk.LEFT)
+        self.plot_scope_combo = self._track(ttk.Combobox(
+            batch_row, state="readonly", width=22, textvariable=self.plot_scope_var,
+            values=("自动（按每张表建议）", "明确列"),
+        ))
+        self.plot_scope_combo.pack(side=tk.LEFT, padx=(4, 12))
+        self.plot_scope_var.trace_add("write", lambda *_args: self._sync_batch_controls())
+        ttk.Label(batch_row, text="图形").pack(side=tk.LEFT)
+        self.batch_kind_combo = self._track(ttk.Combobox(
+            batch_row, state="readonly", width=12, textvariable=self.batch_kind_var,
+            values=("auto", "none", "line", "scatter", "line_symbol", "column"),
+        ))
+        self.batch_kind_combo.pack(side=tk.LEFT, padx=(4, 12))
+        ttk.Label(batch_row, text="批次名称").pack(side=tk.LEFT)
+        self.batch_name_entry = self._track(ttk.Entry(batch_row, textvariable=self.batch_name_var, width=24))
+        self.batch_name_entry.pack(side=tk.LEFT, padx=(4, 0))
+        explicit_row = ttk.Frame(batch_box)
+        explicit_row.pack(fill=tk.X, pady=(4, 0))
+        ttk.Label(explicit_row, text="X").pack(side=tk.LEFT)
+        self.explicit_x_entry = self._track(ttk.Entry(explicit_row, textvariable=self.explicit_x_var, width=18))
+        self.explicit_x_entry.pack(side=tk.LEFT, padx=(4, 10))
+        ttk.Label(explicit_row, text="Y（逗号分隔）").pack(side=tk.LEFT)
+        self.explicit_y_entry = self._track(ttk.Entry(explicit_row, textvariable=self.explicit_y_var, width=28))
+        self.explicit_y_entry.pack(side=tk.LEFT, padx=(4, 10))
+        ttk.Label(explicit_row, text="误差列").pack(side=tk.LEFT)
+        self.explicit_error_entry = self._track(ttk.Entry(explicit_row, textvariable=self.explicit_error_var, width=18))
+        self.explicit_error_entry.pack(side=tk.LEFT, padx=(4, 0))
+
         bottom = ttk.Frame(outer)
         bottom.pack(fill=tk.X, pady=(8, 0))
         format_frame = ttk.Frame(bottom)
-        format_frame.pack(side=tk.LEFT)
-        ttk.Label(format_frame, text="输出").pack(side=tk.LEFT)
-        self._track(ttk.Radiobutton(format_frame, text="Origin 工程 (.opju)", value="opju", variable=self.format_var, command=self._format_changed)).pack(side=tk.LEFT, padx=(8, 0))
-        self._track(ttk.Radiobutton(format_frame, text="Excel 工作簿 (.xlsx)", value="xlsx", variable=self.format_var, command=self._format_changed)).pack(side=tk.LEFT, padx=(8, 0))
-        self.keep_open_check = self._track(ttk.Checkbutton(format_frame, text="Origin 完成后保持打开", variable=self.keep_open_var))
-        self.keep_open_check.pack(side=tk.LEFT, padx=(12, 0))
+        format_frame.pack(side=tk.LEFT, fill=tk.X, expand=True)
+        ttk.Label(format_frame, text="方式").pack(side=tk.LEFT)
+        self._track(ttk.Radiobutton(
+            format_frame, text="每个来源一个文件", value="per_file", variable=self.layout_var, command=self._layout_changed,
+        )).pack(side=tk.LEFT, padx=(6, 0))
+        self._track(ttk.Radiobutton(
+            format_frame, text="合并为一个工程", value="unified", variable=self.layout_var, command=self._layout_changed,
+        )).pack(side=tk.LEFT, padx=(6, 10))
+        self._track(ttk.Radiobutton(format_frame, text="OPJU", value="opju", variable=self.format_var, command=self._format_changed)).pack(side=tk.LEFT)
+        self._track(ttk.Radiobutton(format_frame, text="XLSX", value="xlsx", variable=self.format_var, command=self._format_changed)).pack(side=tk.LEFT, padx=(6, 0))
+        self.keep_open_check = self._track(ttk.Checkbutton(format_frame, text="完成后保持打开", variable=self.keep_open_var))
+        self.keep_open_check.pack(side=tk.LEFT, padx=(8, 0))
+        self.pdf_check = self._track(ttk.Checkbutton(format_frame, text="每图 PDF", variable=self.pdf_var))
+        self.pdf_check.pack(side=tk.LEFT, padx=(8, 0))
+        self.overwrite_check = self._track(ttk.Checkbutton(format_frame, text="覆盖已有输出", variable=self.batch_overwrite_var))
+        self.overwrite_check.pack(side=tk.LEFT, padx=(8, 0))
 
-        actions = ttk.Frame(bottom)
-        actions.pack(side=tk.RIGHT)
+        actions = ttk.Frame(outer)
+        actions.pack(fill=tk.X, pady=(6, 0))
+        self._track(ttk.Button(actions, text="预览选中", command=self.preview_selected)).pack(side=tk.LEFT, padx=(0, 5))
         self._track(ttk.Button(actions, text="加载计划 JSON", command=self.load_plan)).pack(side=tk.LEFT, padx=(0, 5))
         self._track(ttk.Button(actions, text="保存计划 JSON", command=self.save_plan)).pack(side=tk.LEFT, padx=(0, 5))
+        self._track(ttk.Button(actions, text="继续批次…", command=self.continue_batch)).pack(side=tk.LEFT, padx=(0, 5))
+        self._track(ttk.Button(actions, text="重试失败项…", command=self.retry_failed_batch)).pack(side=tk.LEFT, padx=(0, 5))
         self._track(ttk.Button(actions, text="批量谱线模式", command=self.open_spectra_gui)).pack(side=tk.LEFT, padx=(0, 5))
         self.export_button = self._track(ttk.Button(actions, text="创建文件…", command=self.export_data))
         self.export_button.pack(side=tk.LEFT)
+        self.stop_button = ttk.Button(actions, text="停止后续", command=self.stop_later_tasks)
+        self.stop_button.pack(side=tk.LEFT, padx=(8, 0))
+
+        task_frame = ttk.LabelFrame(outer, text="批量任务", padding=5)
+        task_frame.pack(fill=tk.BOTH, expand=True, pady=(7, 0))
+        self.task_tree = ttk.Treeview(
+            task_frame,
+            columns=("source", "status", "detail"),
+            show="headings",
+            height=5,
+        )
+        for column, heading, width in (
+            ("source", "来源", 420),
+            ("status", "状态", 140),
+            ("detail", "错误或 PDF", 460),
+        ):
+            self.task_tree.heading(column, text=heading)
+            self.task_tree.column(column, width=width, anchor=tk.W, stretch=column != "status")
+        task_scroll = ttk.Scrollbar(task_frame, orient=tk.VERTICAL, command=self.task_tree.yview)
+        self.task_tree.configure(yscrollcommand=task_scroll.set)
+        self.task_tree.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
+        task_scroll.pack(side=tk.RIGHT, fill=tk.Y)
         self._format_changed()
 
-        ttk.Label(outer, textvariable=self.status_var, wraplength=980, justify=tk.LEFT).pack(fill=tk.X, pady=(8, 0))
+        ttk.Label(outer, textvariable=self.status_var, wraplength=1060, justify=tk.LEFT).pack(fill=tk.X, pady=(8, 0))
 
     def _hook_drop(self) -> None:
         self._hook_after = None
@@ -526,7 +729,8 @@ class GeneralDataApp:
             return
         requested = [Path(path) for path in raw_paths]
         existing = list(self._paths)
-        self.status_var.set("正在后台扫描文件…")
+        list_only = self._per_file_mode()
+        self.status_var.set("正在后台扫描文件…" if list_only else "正在后台扫描并检查文件…")
 
         def scan_task() -> None:
             try:
@@ -550,14 +754,26 @@ class GeneralDataApp:
                     "added": added_records,
                     "rejected": rejected,
                     "announce": announce,
+                    "list_only": list_only,
                 })
-                self._inspect_paths_worker(added, options, "replace")
+                if list_only:
+                    for index, (path, key) in enumerate(added_records):
+                        self._thread_queue.put({
+                            "kind": "listed",
+                            "path": str(path),
+                            "path_key": key,
+                        })
+                        if index % 25 == 0:
+                            time.sleep(0)
+                else:
+                    self._inspect_paths_worker(added, options, "replace")
                 self._thread_queue.put({
                     "kind": "inspect_done",
                     "mode": "add",
                     "added_count": len(added),
                     "announce": announce,
                     "rejected_count": len(rejected),
+                    "list_only": list_only,
                 })
             except Exception as exc:
                 self._thread_queue.put({"kind": "job_error", "error": _job_error_text(exc)})
@@ -620,7 +836,14 @@ class GeneralDataApp:
             return
         self._loaded_plan = None
         self._plan_base_dir = None
-        paths = list(self._paths)
+        if self._per_file_mode():
+            touched_keys = set(self._table_keys) | set(self._source_errors)
+            paths = [path for path, key in zip(self._paths, self._path_keys) if key in touched_keys]
+            if not paths:
+                self.status_var.set("还没有预览过的来源。批量导出会把已发现的路径交给导出核心，不必先读完全部文件。")
+                return
+        else:
+            paths = list(self._paths)
         self.status_var.set("正在后台重新检查来源…")
 
         def reload_task() -> None:
@@ -642,6 +865,69 @@ class GeneralDataApp:
             messagebox.showerror("读取选项无效", "跳过行数必须大于或等于 0。", parent=self.root)
             return None
         return options
+
+    def _per_file_mode(self) -> bool:
+        return getattr(self, "layout_var", None) is not None and self.layout_var.get() == "per_file"
+
+    def preview_selected(self) -> None:
+        """Inspect one selected source. Batch export does not require this for every file."""
+        if self._busy or not self._per_file_mode():
+            return
+        selection = self.table_tree.selection()
+        if not selection:
+            self.status_var.set("先在列表里选一个来源，再预览。")
+            return
+        table = self._tables_by_iid.get(selection[0])
+        if not table:
+            return
+        path = Path((table.get("source") or {}).get("path") or "")
+        if not str(path):
+            return
+        options = self._try_read_options()
+        if options is None:
+            return
+        self.status_var.set(f"正在预览：{path.name}")
+
+        def preview_task() -> None:
+            try:
+                self._inspect_paths_worker([path], options, "replace")
+                self._thread_queue.put({
+                    "kind": "inspect_done",
+                    "mode": "preview",
+                    "added_count": 1,
+                    "announce": False,
+                })
+            except Exception as exc:
+                self._thread_queue.put({"kind": "job_error", "error": _job_error_text(exc)})
+
+        self._start_thread(preview_task, "preview")
+
+    def _layout_changed(self) -> None:
+        self._sync_batch_controls()
+        if self._busy or self._per_file_mode() or not self._paths:
+            return
+        inspected = set(self._table_keys) | set(self._source_errors)
+        missing = [path for path, key in zip(self._paths, self._path_keys) if key not in inspected]
+        if not missing:
+            return
+        options = self._try_read_options()
+        if options is None:
+            return
+        self.status_var.set("合并模式会检查尚未预览的来源…")
+
+        def inspect_missing() -> None:
+            try:
+                self._inspect_paths_worker(missing, options, "replace")
+                self._thread_queue.put({
+                    "kind": "inspect_done",
+                    "mode": "reload",
+                    "added_count": len(missing),
+                    "announce": False,
+                })
+            except Exception as exc:
+                self._thread_queue.put({"kind": "job_error", "error": _job_error_text(exc)})
+
+        self._start_thread(inspect_missing, "inspect")
 
     def _inspect_paths_worker(self, paths: list[Path], options: dict[str, Any], update: str) -> None:
         for path in paths:
@@ -771,6 +1057,7 @@ class GeneralDataApp:
         def destroy(*args, **kwargs):
             if not self._closed:
                 self._closed = True
+                self._request_batch_cancel()
                 self._cancel_scheduled_ui()
                 self._abandon_source_job()
                 self._release_import_handles()
@@ -784,6 +1071,8 @@ class GeneralDataApp:
         self._thread_kind = None
         self._busy = False
         self._pending_outcomes.clear()
+        if getattr(self, "_pending_listed", None) is not None:
+            self._pending_listed.clear()
 
     def _start_thread(self, target, kind: str) -> None:
         if self._busy:
@@ -793,6 +1082,8 @@ class GeneralDataApp:
         self._done_message = None
         self._poll_confirms = 0
         self._pending_outcomes.clear()
+        if getattr(self, "_pending_listed", None) is not None:
+            self._pending_listed.clear()
         self._set_busy(True)
         self._thread_kind = kind
         self._thread = threading.Thread(target=target, name=f"origin-bridge-{kind}", daemon=True)
@@ -814,22 +1105,26 @@ class GeneralDataApp:
             self._dispatch_worker_message(message)
         flushed = self._flush_outcomes(started)
         if flushed and self._paths:
-            seen = len(self._tables) + len(self._source_errors)
             try:
-                self.status_var.set(f"正在检查来源 {seen}/{len(self._paths)}…")
+                if self._thread_kind == "scan" and self._per_file_mode():
+                    shown = len(self.table_tree.get_children())
+                    self.status_var.set(f"正在列出来源 {shown}/{len(self._paths)}…")
+                else:
+                    seen = len(self._tables) + len(self._source_errors)
+                    self.status_var.set(f"正在检查来源 {seen}/{len(self._paths)}…")
             except tk.TclError:
                 self._abandon_source_job()
                 return
         thread = self._thread
         alive = thread is not None and thread.is_alive()
-        more = bool(self._pending_outcomes) or not self._thread_queue.empty()
+        more = bool(self._pending_outcomes) or bool(getattr(self, "_pending_listed", None)) or not self._thread_queue.empty()
         if alive or more:
             self._poll_confirms = 0
             self._after(16, self._poll_thread)
             return
         if thread is not None:
             thread.join(timeout=0.2)
-            if thread.is_alive() or not self._thread_queue.empty() or self._pending_outcomes:
+            if thread.is_alive() or not self._thread_queue.empty() or self._pending_outcomes or getattr(self, "_pending_listed", None):
                 self._after(16, self._poll_thread)
                 return
         if not self._job_terminal and self._poll_confirms < 1:
@@ -855,6 +1150,9 @@ class GeneralDataApp:
             if isinstance(outcome, dict):
                 self._pending_outcomes.append((outcome, str(message.get("update") or "replace")))
             return
+        if kind == "listed":
+            self._pending_listed.append(message)
+            return
         if kind == "inspect_done":
             self._done_message = message
             self._job_terminal = True
@@ -879,6 +1177,13 @@ class GeneralDataApp:
 
     def _flush_outcomes(self, started: float) -> int:
         flushed = 0
+        listed = getattr(self, "_pending_listed", None)
+        if listed is None:
+            listed = deque()
+            self._pending_listed = listed
+        while listed and flushed < _UI_ROW_BUDGET and (time.monotonic() - started) < _UI_FRAME_SECONDS:
+            self._insert_listed_row(listed.popleft())
+            flushed += 1
         while self._pending_outcomes and flushed < _UI_ROW_BUDGET and (time.monotonic() - started) < _UI_FRAME_SECONDS:
             outcome, update = self._pending_outcomes.popleft()
             self._apply_outcome(outcome, update)
@@ -982,6 +1287,22 @@ class GeneralDataApp:
             except tk.TclError:
                 self._busy = False
             return
+        if done.get("list_only"):
+            failed = len(self._source_errors)
+            text = f"已发现 {len(self._paths)} 个来源。每个文件会单独导出；预览只检查选中的来源。"
+            if failed:
+                text += f" {failed} 个已预览来源有错误，其余仍可导出。"
+            try:
+                self.status_var.set(text)
+            except tk.TclError:
+                self._busy = False
+            return
+        if done.get("mode") == "preview":
+            try:
+                self.status_var.set("预览完成。未预览的来源仍会按路径进入批量导出。")
+            except tk.TclError:
+                self._busy = False
+            return
         if done.get("mode") == "add" and not done.get("added_count") and not self._source_errors:
             return
         failed = len(self._source_errors)
@@ -1074,10 +1395,31 @@ class GeneralDataApp:
         self._tables = ordered
         self._table_keys = ordered_keys
 
+    def _insert_listed_row(self, item: dict[str, Any]) -> None:
+        path = str(item.get("path") or "")
+        path_key = str(item.get("path_key") or self._cached_path_key(path))
+        if path_key in self._iids_by_path or path_key in set(self._table_keys) or path_key in self._source_errors:
+            return
+        placeholder = {
+            "source": {"path": path, "sheet": None, "sha256": "", "options": {}},
+            "name": Path(path).stem,
+            "n_rows": "",
+            "columns": [],
+            "warnings": [],
+            "pending": True,
+        }
+        iid = self._insert_row_at(placeholder, tk.END)
+        try:
+            self.table_tree.see(iid)
+        except tk.TclError:
+            return
+
     def _row_values(self, table: dict[str, Any]) -> tuple[Any, ...]:
         source = table.get("source") or {}
         if table.get("error"):
             return (source.get("path", ""), "", "错误", "", table.get("error", ""))
+        if table.get("pending"):
+            return (source.get("path", ""), "", "", "", "未预览")
         return (
             source.get("path", ""),
             source.get("sheet") or "",
@@ -1126,6 +1468,8 @@ class GeneralDataApp:
         self._tables_by_iid.clear()
         self._iids_by_path.clear()
         self._pending_outcomes.clear()
+        if getattr(self, "_pending_listed", None) is not None:
+            self._pending_listed.clear()
         children = self.table_tree.get_children()
         if children:
             self.table_tree.delete(*children)
@@ -1154,9 +1498,13 @@ class GeneralDataApp:
                 chosen = current[0]
             else:
                 chosen = children[0]
-        self.table_tree.selection_set(chosen)
-        self.table_tree.focus(chosen)
-        self._select_table(self._tables_by_iid[chosen])
+        self._suppress_preview = True
+        try:
+            self.table_tree.selection_set(chosen)
+            self.table_tree.focus(chosen)
+            self._select_table(self._tables_by_iid[chosen])
+        finally:
+            self._suppress_preview = False
 
     @staticmethod
     def _default_plot(table: dict[str, Any]) -> dict[str, Any]:
@@ -1183,7 +1531,8 @@ class GeneralDataApp:
             return
         self._save_current_plot()
         selection = self.table_tree.selection()
-        self._select_table(self._tables_by_iid[selection[0]] if selection else None)
+        table = self._tables_by_iid.get(selection[0]) if selection else None
+        self._select_table(table)
 
     def _select_table(self, table: dict[str, Any] | None) -> None:
         self._current_key = self._table_identity(table["source"]) if table else None
@@ -1211,6 +1560,10 @@ class GeneralDataApp:
     def _show_table(self, table: dict[str, Any] | None) -> None:
         self.column_tree.delete(*self.column_tree.get_children())
         self.sample_tree.delete(*self.sample_tree.get_children())
+        if table is not None and table.get("pending"):
+            self._clear_source_controls()
+            self.status_var.set("此来源尚未预览。批量导出仍会包含它；预览不会把这张表的列建议写成整批的明确列。")
+            return
         if table is not None and table.get("error"):
             self._clear_source_controls()
             self.status_var.set(f"来源读取失败：{table['error']}")
@@ -1330,11 +1683,52 @@ class GeneralDataApp:
         is_origin = self.format_var.get() == "opju"
         if not is_origin:
             self.keep_open_var.set(False)
+            self.pdf_var.set(False)
         state = "normal" if is_origin else "disabled"
         try:
             self.keep_open_check.configure(state=state)
             self._widget_states[self.keep_open_check] = state
         except (AttributeError, tk.TclError):
+            pass
+        self._sync_batch_controls()
+
+    def _sync_batch_controls(self) -> None:
+        per_file = self._per_file_mode()
+        explicit = per_file and self.plot_scope_var.get() in {"explicit", "明确列"}
+        origin = self.format_var.get() == "opju"
+        pairs = (
+            (getattr(self, "explicit_x_entry", None), explicit),
+            (getattr(self, "explicit_y_entry", None), explicit),
+            (getattr(self, "explicit_error_entry", None), explicit),
+            (getattr(self, "batch_kind_combo", None), per_file),
+            (getattr(self, "plot_scope_combo", None), per_file),
+            (getattr(self, "batch_name_entry", None), per_file),
+            (getattr(self, "pdf_check", None), per_file and origin),
+            (getattr(self, "overwrite_check", None), per_file),
+        )
+        for widget, enabled in pairs:
+            if widget is None:
+                continue
+            state = "normal" if enabled else "disabled"
+            try:
+                if widget in (getattr(self, "plot_scope_combo", None), getattr(self, "batch_kind_combo", None)):
+                    state = "readonly" if enabled else "disabled"
+                widget.configure(state=state)
+                self._widget_states[widget] = state
+            except tk.TclError:
+                continue
+        if not (per_file and origin):
+            self.pdf_var.set(False)
+        self._sync_stop_button()
+
+    def _sync_stop_button(self) -> None:
+        button = getattr(self, "stop_button", None)
+        if button is None:
+            return
+        enabled = bool(self._busy and getattr(self, "_import_kind", None) == "batch" and self._import_cancel is not None)
+        try:
+            button.configure(state="normal" if enabled else "disabled")
+        except tk.TclError:
             pass
 
     def _reject_incomplete_sources(self) -> None:
@@ -1424,8 +1818,304 @@ class GeneralDataApp:
     def _default_output_path(self, fmt: str) -> Path:
         return _default_output_for(self._paths, fmt)
 
+    def _current_batch_plot(self) -> dict[str, Any]:
+        return build_global_plot(
+            scope=self.plot_scope_var.get(),
+            kind=self.batch_kind_var.get(),
+            explicit_x=self.explicit_x_var.get(),
+            explicit_y=self.explicit_y_var.get(),
+            explicit_error=self.explicit_error_var.get(),
+        )
+
+    def _export_per_file(self) -> None:
+        if not self._paths:
+            messagebox.showinfo("没有数据", "请先添加数据文件或文件夹。", parent=self.root)
+            return
+        fmt = self.format_var.get()
+        if fmt not in _FORMAT_SUFFIX:
+            messagebox.showerror("输出格式无效", "请选择 OPJU 或 XLSX。", parent=self.root)
+            return
+        if self.pdf_var.get() and fmt != "opju":
+            messagebox.showerror("不能导出 PDF", "每图 PDF 只适用于每个来源一个 OPJU。", parent=self.root)
+            return
+        options = self._try_read_options()
+        if options is None:
+            return
+        try:
+            plot = self._current_batch_plot()
+        except ValueError as exc:
+            messagebox.showerror("绘图设置无效", str(exc), parent=self.root)
+            return
+        if fmt == "opju" and not self._confirm_origin_idle():
+            return
+        output_dir = filedialog.askdirectory(parent=self.root, title="选择批量输出目录", mustexist=False)
+        if not output_dir:
+            return
+        try:
+            from .batch import build_batch_request
+
+            request = build_batch_request(
+                self._paths,
+                output_dir,
+                layout="per_file",
+                format=fmt,
+                read_options=options,
+                plot=plot,
+                overwrite=bool(self.batch_overwrite_var.get()),
+                pdf=bool(self.pdf_var.get()) if fmt == "opju" else False,
+                keep_open=bool(self.keep_open_var.get()) if fmt == "opju" else False,
+                resume=False,
+                retry_task_ids=[],
+            )
+        except Exception as exc:
+            messagebox.showerror("无法创建批量请求", str(exc), parent=self.root)
+            return
+        self._saved_request = request
+        self._launch_batch(request, name=self.batch_name_var.get())
+
+    def _confirm_origin_idle(self) -> bool:
+        try:
+            import spectra_to_origin as sto
+
+            if sto.origin_process_running():
+                messagebox.showwarning(
+                    "请先关闭 Origin",
+                    "检测到 Origin 正在运行。请先保存并关闭当前 Origin 工程，再重新创建文件；程序不会重置当前会话。",
+                    parent=self.root,
+                )
+                return False
+        except Exception as exc:
+            messagebox.showerror("Origin 状态检查失败", str(exc), parent=self.root)
+            return False
+        return True
+
+    def _launch_batch(self, request: dict[str, Any], *, name: str) -> None:
+        if self._busy:
+            return
+        try:
+            json.dumps(request, ensure_ascii=False)
+            save_batch_config(
+                config_path_for(request["record_path"]),
+                name=name,
+                record_path=request["record_path"],
+                inputs=list(request["inputs"]),
+                request=request,
+            )
+        except Exception as exc:
+            messagebox.showerror("无法保存批次配置", str(exc), parent=self.root)
+            self.status_var.set("批次配置没有写入，导出没有开始。")
+            return
+        self.status_var.set("正在后台批量导出；窗口仍可响应。停止后续会在当前项结束后生效。")
+        try:
+            self._start_batch_process(request)
+        except Exception as exc:
+            self._set_busy(False)
+            messagebox.showerror("无法启动批量导出", str(exc), parent=self.root)
+            self.status_var.set("无法启动后台批量导出。")
+
+    def _start_batch_process(self, request: dict[str, Any]) -> None:
+        context = multiprocessing.get_context("spawn")
+        recv_conn, send_conn = context.Pipe(duplex=False)
+        cancel = context.Event()
+        drive_spec = os.environ.pop("ORI_GUI_BATCH_DRIVE", None)
+        process = context.Process(target=batch_worker, args=(send_conn, request, cancel))
+        try:
+            process.start()
+        except Exception:
+            recv_conn.close()
+            send_conn.close()
+            raise
+        finally:
+            if drive_spec is not None:
+                os.environ["ORI_GUI_BATCH_DRIVE"] = drive_spec
+        send_conn.close()
+        self._import_recv = recv_conn
+        self._import_process = process
+        self._import_cancel = cancel
+        self._import_kind = "batch"
+        self._import_result = None
+        self._import_exit_waits = 0
+        self._import_eof = False
+        self._batch_terminal = False
+        self._clear_task_rows()
+        self._set_busy(True)
+        self._after(100, self._poll_import)
+
+    def _clear_task_rows(self) -> None:
+        self._task_iids.clear()
+        children = self.task_tree.get_children()
+        if children:
+            self.task_tree.delete(*children)
+
+    def _request_batch_cancel(self) -> None:
+        cancel = getattr(self, "_import_cancel", None)
+        if cancel is None:
+            return
+        try:
+            cancel.set()
+        except Exception:
+            return
+
+    def stop_later_tasks(self) -> None:
+        """Ask the batch to finish the current task and not start later ones.
+
+        This does not interrupt a COM call that has not yet proved which Origin
+        process it owns. A stuck startup is not ended from this button.
+        """
+        if getattr(self, "_import_cancel", None) is None:
+            return
+        self._request_batch_cancel()
+        try:
+            self.status_var.set("已请求停止后续任务。当前这项会跑完并保存；尚未开始的会取消。这不能打断卡在启动证明之前的 Origin。")
+        except tk.TclError:
+            return
+
+    def continue_batch(self) -> None:
+        self._choose_resume(retry=False)
+
+    def retry_failed_batch(self) -> None:
+        self._choose_resume(retry=True)
+
+    def _choose_resume(self, *, retry: bool) -> None:
+        if self._busy or not self._per_file_mode():
+            if not self._busy and not self._per_file_mode():
+                messagebox.showinfo("只用于每个来源一个文件", "PDF、继续和重试失败项只在“每个来源一个文件”模式下可用。合并工程仍使用原来的单次导出。", parent=self.root)
+            return
+        selected = filedialog.askopenfilename(
+            parent=self.root,
+            title="选择批量运行记录",
+            filetypes=(("批量记录", "*.json"), ("所有文件", "*.*")),
+        )
+        if not selected:
+            return
+        record_path = Path(selected)
+        config_path = find_config_for_record(record_path)
+        if config_path is None:
+            proceed = messagebox.askokcancel(
+                "缺少批次配置",
+                "这份运行记录没有配套的完整批次配置。核心回执不能还原读取选项和绘图设置。\n\n"
+                "请接着选择原来的批次配置。取消后不会按当前窗口的默认值重新导出。",
+                parent=self.root,
+            )
+            if not proceed:
+                self.status_var.set("没有批次配置，已取消继续。")
+                return
+            chosen = filedialog.askopenfilename(
+                parent=self.root,
+                title="选择原来的批次配置",
+                filetypes=(("批次配置", "*.json"), ("所有文件", "*.*")),
+            )
+            if not chosen:
+                self.status_var.set("没有批次配置，已取消继续。")
+                return
+            config_path = Path(chosen)
+        try:
+            config = load_batch_config(config_path)
+        except ValueError as exc:
+            messagebox.showerror("无法读取批次配置", str(exc), parent=self.root)
+            return
+        if _normalized_path(config["record_path"]) != _normalized_path(record_path):
+            messagebox.showerror(
+                "配置与记录不一致",
+                "所选批次配置对应的记录不是这份运行记录。程序不会改用窗口里的默认值重新导出。",
+                parent=self.root,
+            )
+            return
+        request = copy.deepcopy(config["request"])
+        request["resume"] = True
+        request["overwrite"] = bool(config["request"].get("overwrite", False))
+        if retry:
+            from .batch import load_batch_record
+
+            record = load_batch_record(record_path)
+            request["retry_task_ids"] = [
+                task_id
+                for task_id, task in dict(record.get("tasks") or {}).items()
+                if isinstance(task, dict) and task.get("status") in {"failed", "cancelled", "blocked"}
+            ]
+        else:
+            request["retry_task_ids"] = []
+        self._saved_request = request
+        self._arm_restored_batch(config, request)
+
+    def _arm_restored_batch(self, config: dict[str, Any], request: dict[str, Any]) -> None:
+        """Show the saved source list, then start that saved request."""
+        self._apply_saved_request_to_widgets(config)
+        self._set_busy(True)
+        pending = [Path(item) for item in request["inputs"]]
+        self._clear_listed_sources()
+        self._paths = []
+        self._path_keys = []
+        self._source_errors.clear()
+        self._loaded_plan = None
+        self._plan_base_dir = None
+
+        def step() -> None:
+            if not self._ui_alive():
+                return
+            started = time.monotonic()
+            inserted = 0
+            while pending and inserted < _UI_ROW_BUDGET and (time.monotonic() - started) < _UI_FRAME_SECONDS:
+                path = pending.pop(0)
+                key = self._cached_path_key(path)
+                self._paths.append(path)
+                self._path_keys.append(key)
+                self._remember_key(path, key)
+                self._insert_listed_row({"path": str(path), "path_key": key})
+                inserted += 1
+            if pending:
+                try:
+                    self.status_var.set(f"正在恢复来源列表 {len(self._paths)}/{len(self._paths) + len(pending)}…")
+                except tk.TclError:
+                    return
+                self._after(1, step)
+                return
+            self._set_busy(False)
+            self._launch_batch(request, name=str(config.get("name") or ""))
+
+        self.status_var.set("正在恢复已保存的批次配置和全部来源…")
+        step()
+
+    def _apply_saved_request_to_widgets(self, config: dict[str, Any]) -> None:
+        request = config["request"]
+        self.batch_name_var.set(str(config.get("name") or ""))
+        self.layout_var.set("per_file")
+        fmt = request.get("format", "opju")
+        self.format_var.set(fmt if fmt in _FORMAT_SUFFIX else "opju")
+        self.pdf_var.set(bool(request.get("pdf")))
+        self.batch_overwrite_var.set(bool(request.get("overwrite")))
+        self.keep_open_var.set(bool(request.get("keep_open")))
+        self._apply_read_options(request.get("read_options") or {})
+        plot = request.get("plot") or {}
+        kind = str(plot.get("kind") or "auto")
+        self.batch_kind_var.set(kind if kind in {"auto", "none", "line", "scatter", "line_symbol", "column"} else "auto")
+        explicit = plot.get("x") not in (None, "auto") or plot.get("y") not in (None, "auto") or isinstance(plot.get("y"), list)
+        self.plot_scope_var.set("明确列" if explicit else "自动（按每张表建议）")
+        if explicit:
+            self.explicit_x_var.set("" if plot.get("x") in (None, "auto") else str(plot.get("x")))
+            y_value = plot.get("y")
+            if isinstance(y_value, list):
+                self.explicit_y_var.set(", ".join(str(item) for item in y_value))
+            elif y_value in (None, "auto"):
+                self.explicit_y_var.set("")
+            else:
+                self.explicit_y_var.set(str(y_value))
+            errors = plot.get("y_error")
+            if isinstance(errors, dict) and errors:
+                self.explicit_error_var.set(str(next(iter(errors.values()))))
+            else:
+                self.explicit_error_var.set("")
+        else:
+            self.explicit_x_var.set("")
+            self.explicit_y_var.set("")
+            self.explicit_error_var.set("")
+        self._sync_batch_controls()
+
     def export_data(self) -> None:
         if self._busy:
+            return
+        if self._per_file_mode():
+            self._export_per_file()
             return
         fmt = self.format_var.get()
         if fmt not in _FORMAT_SUFFIX:
@@ -1494,6 +2184,8 @@ class GeneralDataApp:
         send_conn.close()
         self._import_recv = recv_conn
         self._import_process = process
+        self._import_cancel = None
+        self._import_kind = "plan"
         self._import_result = None
         self._import_exit_waits = 0
         self._import_eof = False
@@ -1502,6 +2194,7 @@ class GeneralDataApp:
 
     def _poll_import(self) -> None:
         if not self._ui_alive():
+            self._request_batch_cancel()
             self._release_import_handles()
             self._busy = False
             return
@@ -1527,11 +2220,21 @@ class GeneralDataApp:
                 if isinstance(result, dict):
                     self._import_result = result
             elif message.get("type") == "progress":
+                event = message.get("event")
+                if isinstance(event, dict):
+                    try:
+                        self._apply_batch_progress(event)
+                    except tk.TclError:
+                        self._request_batch_cancel()
+                        self._release_import_handles()
+                        self._busy = False
+                        return
                 text = message.get("text")
                 if text:
                     try:
                         self.status_var.set(str(text))
                     except tk.TclError:
+                        self._request_batch_cancel()
                         self._release_import_handles()
                         self._busy = False
                         return
@@ -1556,14 +2259,46 @@ class GeneralDataApp:
             return
         self._complete_import()
 
+    def _apply_batch_progress(self, event: dict[str, Any]) -> None:
+        if event.get("type") == "batch":
+            count = event.get("count")
+            self.status_var.set(f"批量导出已开始，共 {count} 个来源。停止后续会在当前项结束后生效。")
+            return
+        if event.get("type") != "task":
+            return
+        tree = getattr(self, "task_tree", None)
+        if tree is None:
+            return
+        task_id = str(event.get("task_id") or event.get("source") or "")
+        source = str(event.get("source") or "")
+        values = (source, _format_task_status(event), _format_task_detail(event))
+        iid = self._task_iids.get(task_id)
+        if iid and tree.exists(iid):
+            tree.item(iid, values=values)
+        else:
+            self._task_seq = getattr(self, "_task_seq", 0) + 1
+            iid = f"t{self._task_seq}"
+            tree.insert("", tk.END, iid=iid, values=values)
+            self._task_iids[task_id] = iid
+        tree.see(iid)
+        index = event.get("index")
+        count = event.get("count")
+        if isinstance(index, int) and isinstance(count, int):
+            self.status_var.set(f"批量进度 {index + 1}/{count}：{Path(source).name} {_format_task_status(event)}")
+
     def _release_import_handles(self) -> None:
         """Close the parent pipe. Close a finished child; reap a live one later.
 
         Used when the window is already going away, including direct
         ``root.destroy()`` after the import poll has been cancelled. A worker
         that is still saving is not terminated and is not joined on the Tk
-        thread. ``_complete_import`` still finishes a normal export.
+        thread. Batch close requests cancel before the parent pipe is closed
+        so the current task can still finish and later tasks do not start.
+        ``_complete_import`` still finishes a normal export.
         """
+        self._request_batch_cancel()
+        self._import_cancel = None
+        self._import_kind = None
         process = self._import_process
         recv_conn = self._import_recv
         self._import_process = None
@@ -1617,10 +2352,13 @@ class GeneralDataApp:
         threading.Thread(target=reap, name="origin-bridge-import-reap", daemon=True).start()
 
     def _complete_import(self) -> None:
+        kind = getattr(self, "_import_kind", None)
         process = self._import_process
         recv_conn = self._import_recv
         self._import_process = None
         self._import_recv = None
+        self._import_cancel = None
+        self._import_kind = None
         exit_code = None
         if process is not None:
             try:
@@ -1648,6 +2386,10 @@ class GeneralDataApp:
             "ok": False,
             "error": f"后台进程未返回结果（退出码 {exit_code}）。",
         }
+        if kind == "batch":
+            self._present_batch_result(result)
+            self._import_result = None
+            return
         if result.get("ok"):
             output = result.get("output", {})
             warnings = result.get("warnings", [])
@@ -1742,6 +2484,8 @@ class GeneralDataApp:
                 if not isinstance(item, dict) or not isinstance(item.get("source"), dict) or not item["source"].get("path"):
                     raise ValueError("计划中的每张表都必须包含 source.path。")
             self._plan_base_dir = Path(path).resolve().parent
+            self.layout_var.set("unified")
+            self._sync_batch_controls()
             self._loaded_plan = plan
             self._paths = list(dict.fromkeys(
                 _resolve_plan_path(item["source"]["path"], self._plan_base_dir) for item in plan["tables"]
@@ -1808,15 +2552,47 @@ class GeneralDataApp:
             self.table_tree.state(["disabled"] if busy else ["!disabled"])
         except tk.TclError:
             pass
+        self._sync_stop_button()
+
+    def _present_batch_result(self, result: dict[str, Any]) -> None:
+        tasks = result.get("tasks") if isinstance(result.get("tasks"), list) else []
+        tree = getattr(self, "task_tree", None)
+        if tree is not None and tasks and not tree.get_children():
+            for task in tasks:
+                if not isinstance(task, dict):
+                    continue
+                output = task.get("output")
+                event = dict(task)
+                event["type"] = "task"
+                if isinstance(output, dict):
+                    event["output"] = output.get("path")
+                self._apply_batch_progress(event)
+        counts = result.get("counts") if isinstance(result.get("counts"), dict) else {}
+        error = result.get("error")
+        if error and not counts:
+            text = error if isinstance(error, str) else str(error)
+            try:
+                self.status_var.set(f"批量导出失败：{text}")
+                if not os.environ.get("ORI_GUI_BATCH_DRIVE"):
+                    messagebox.showerror("批量导出失败", text, parent=self.root)
+            except tk.TclError:
+                self._busy = False
+            return
+        text = "批量导出已结束。" + _format_batch_counts(counts)
+        if result.get("cancelled") or int(counts.get("cancelled") or 0):
+            text += "。已成功的文件保留，尚未开始的任务已取消。"
+        try:
+            self.status_var.set(text)
+            if not os.environ.get("ORI_GUI_BATCH_DRIVE"):
+                messagebox.showinfo("批量导出结束", text + "\n任务列表里有每个文件的状态；PDF 失败会写出具体的图和原因。", parent=self.root)
+        except tk.TclError:
+            self._busy = False
 
     def batch_source_snapshot(self) -> dict[str, Any]:
-        """Read-only handoff for a future batch phase.
+        """Paths plus light summaries. Failed sources stay in ``errors``.
 
-        ``tables`` are per-source summaries (column samples, not full data).
-        ``errors`` are sources that failed inspect and are not successful tables.
-        Batch export, cancel, and manifest are intentionally not wired. This
-        single-project window still refuses a plan while any source listed in
-        ``errors`` is unresolved or not yet inspected.
+        Per-file export may include paths that have not been inspected. This
+        snapshot does not require every source to have succeeded.
         """
         store = getattr(self, "_summaries", None)
         return {
@@ -1828,10 +2604,32 @@ class GeneralDataApp:
         }
 
     def _on_close(self) -> None:
+        if self._busy and getattr(self, "_import_kind", None) == "batch":
+            messagebox.showwarning(
+                "批量仍在运行",
+                "当前这项会继续保存。“停止后续”只取消还没开始的任务，不能打断卡在启动证明之前的 Origin。\n\n"
+                "请先点“停止后续”，等任务列表停止后再关闭。关闭窗口不会强制结束正在写的任务。",
+                parent=self.root,
+            )
+            return
         if self._busy:
             messagebox.showwarning("任务进行中", "数据读取或导出仍在后台运行，请等待完成后再关闭窗口。", parent=self.root)
             return
         self.root.destroy()
+
+    def _schedule_drive(self) -> None:
+        spec = os.environ.get("ORI_GUI_BATCH_DRIVE")
+        if not spec or multiprocessing.current_process().name != "MainProcess":
+            return
+
+        def begin() -> None:
+            if not self._ui_alive():
+                return
+            from .gui_drive import run_drive
+
+            run_drive(self, spec)
+
+        self._after(300, begin)
 
 
 __all__ = ["GeneralDataApp"]
