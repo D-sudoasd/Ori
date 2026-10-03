@@ -88,6 +88,7 @@ def _job_error_text(exc: BaseException) -> str:
 
 
 _REPARSE_POINT = 0x400
+_FILE_ATTRIBUTE_DIRECTORY = 0x10
 
 
 def _path_is_link(path: Path) -> bool:
@@ -119,13 +120,18 @@ def _entry_is_symlink(entry: os.DirEntry[str]) -> bool:
 def _entry_is_directory_link(entry: os.DirEntry[str]) -> bool:
     """True for a junction or a directory symlink.
 
-    On Python 3.13 / Windows a junction is not a symlink:
+    On Python 3.12+ / Windows a junction is not a symlink:
     ``is_dir(follow_symlinks=False)`` is true and ``is_junction`` is true.
     A directory symlink is the opposite: ``is_symlink`` is true and
-    ``is_dir(follow_symlinks=False)`` is false, so it must be classified
-    before the non-following file/dir checks. Python 3.10 has no
-    ``is_junction``; a junction there is a reparse point and still a
-    directory when links are not followed.
+    ``is_dir(follow_symlinks=False)`` is false, so it is classified before
+    the non-following file and directory checks.
+
+    Python 3.10 and 3.11 have no ``is_junction``. A non-symlink reparse
+    point is a directory link only when it also has the directory
+    attribute, which is how a junction still looks when links are not
+    followed. A reparse file (OneDrive placeholder or recall-on-data
+    ``.csv``) has the reparse attribute without the directory attribute,
+    so it stays a file and is not passed to ``scandir``.
     """
     probe = getattr(entry, "is_junction", None)
     if callable(probe):
@@ -140,7 +146,7 @@ def _entry_is_directory_link(entry: os.DirEntry[str]) -> bool:
         except OSError:
             attributes = 0
         if attributes & _REPARSE_POINT:
-            return True
+            return bool(attributes & _FILE_ATTRIBUTE_DIRECTORY)
     if not _entry_is_symlink(entry):
         return False
     try:
@@ -310,7 +316,6 @@ class GeneralDataApp:
         self._thread_kind: str | None = None
         self._import_process = None
         self._import_recv = None
-        self._import_messages: list[dict[str, Any]] = []
         self._import_result: dict[str, Any] | None = None
         self._import_exit_waits = 0
         self._import_eof = False
@@ -752,11 +757,13 @@ class GeneralDataApp:
         self._hook_after = None
 
     def _guard_destroy(self) -> None:
-        """Cancel timers before Tcl tears the window down.
+        """Cancel timers and drop import handles before Tcl tears the window down.
 
-        ``root.destroy()`` is the existing close path and the direct call a
-        scan can receive. A ``<Destroy>`` binding also runs for child widgets
-        and is the wrong place to touch timers.
+        Direct ``root.destroy()`` is the close path a scan or export can hit.
+        Cancelling the import poll must still close the parent pipe. A worker
+        that is still writing is not killed or joined here; a reaper closes
+        it after the process exits and does not touch Tk. A ``<Destroy>``
+        binding also runs for child widgets and is the wrong place to touch timers.
         """
         root = self.root
         original = root.destroy
@@ -766,6 +773,7 @@ class GeneralDataApp:
                 self._closed = True
                 self._cancel_scheduled_ui()
                 self._abandon_source_job()
+                self._release_import_handles()
             return original(*args, **kwargs)
 
         root.destroy = destroy
@@ -856,8 +864,8 @@ class GeneralDataApp:
         added = list(message.get("added") or [])
         if rejected:
             messagebox.showwarning(
-                "忽略不支持的文件",
-                "以下文件格式不在支持列表中：\n" + "\n".join(rejected[:8]),
+                "部分来源未加入",
+                "以下来源没有加入：\n" + "\n".join(rejected[:8]),
                 parent=self.root,
             )
         if added:
@@ -1486,7 +1494,6 @@ class GeneralDataApp:
         send_conn.close()
         self._import_recv = recv_conn
         self._import_process = process
-        self._import_messages = []
         self._import_result = None
         self._import_exit_waits = 0
         self._import_eof = False
@@ -1550,25 +1557,64 @@ class GeneralDataApp:
         self._complete_import()
 
     def _release_import_handles(self) -> None:
+        """Close the parent pipe. Close a finished child; reap a live one later.
+
+        Used when the window is already going away, including direct
+        ``root.destroy()`` after the import poll has been cancelled. A worker
+        that is still saving is not terminated and is not joined on the Tk
+        thread. ``_complete_import`` still finishes a normal export.
+        """
         process = self._import_process
         recv_conn = self._import_recv
         self._import_process = None
         self._import_recv = None
-        if process is not None:
+        if recv_conn is not None:
             try:
-                if process.is_alive():
-                    process.join(timeout=1)
+                recv_conn.close()
+            except OSError:
+                pass
+        if process is None:
+            return
+        try:
+            alive = bool(process.is_alive())
+        except (ValueError, OSError):
+            alive = False
+        if alive:
+            self._reap_import_process(process)
+            return
+        try:
+            process.join(timeout=0)
+        except (ValueError, OSError):
+            pass
+        try:
+            process.close()
+        except (ValueError, OSError):
+            pass
+
+    def _reap_import_process(self, process) -> None:
+        """Join and close an export process after it exits, without touching Tk."""
+
+        def reap() -> None:
+            while True:
+                try:
+                    process.join(timeout=0.2)
+                except (ValueError, OSError):
+                    return
+                try:
+                    if not process.is_alive():
+                        break
+                except ValueError:
+                    return
+            try:
+                process.join(timeout=0)
             except (ValueError, OSError):
                 pass
             try:
                 process.close()
             except (ValueError, OSError):
                 pass
-        if recv_conn is not None:
-            try:
-                recv_conn.close()
-            except OSError:
-                pass
+
+        threading.Thread(target=reap, name="origin-bridge-import-reap", daemon=True).start()
 
     def _complete_import(self) -> None:
         process = self._import_process

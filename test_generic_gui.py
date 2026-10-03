@@ -23,6 +23,7 @@ from origin_bridge import planning
 from origin_bridge.gui import (
     _collect_supported,
     _default_output_for,
+    _path_is_link,
     _plan_table_key,
     _read_options,
     _source_key,
@@ -89,12 +90,23 @@ class GenericGuiContractTests(unittest.TestCase):
             with self.assertRaisesRegex(FileNotFoundError, "does not exist|不存在"):
                 _collect_supported([Path(raw) / "missing.csv"])
 
-    def test_duplicate_table_populate_method_is_gone(self):
+    def test_rejected_warning_lists_original_reasons(self):
         from origin_bridge import gui
         from origin_bridge.gui import GeneralDataApp
 
-        self.assertFalse(hasattr(GeneralDataApp, "_populate_tables"))
-        self.assertFalse(hasattr(gui, "_populate_tables"))
+        app = GeneralDataApp.__new__(GeneralDataApp)
+        app.root = object()
+        link = r"C:\data\dangling（无法跟随目录链接：目标不存在）"
+        with mock.patch.object(gui.messagebox, "showwarning") as showwarning:
+            app._apply_scan({"rejected": [r"C:\data\notes.md", link], "added": [], "announce": False})
+        showwarning.assert_called_once()
+        title, body = showwarning.call_args.args[:2]
+        self.assertEqual(title, "部分来源未加入")
+        self.assertNotIn("格式不支持", title)
+        self.assertNotIn("格式不在支持列表", body)
+        self.assertIn("notes.md", body)
+        self.assertIn("无法跟随目录链接", body)
+        self.assertIn(link, body)
 
     def test_default_workbook_path_does_not_overwrite_an_input_workbook(self):
         with tempfile.TemporaryDirectory() as raw:
@@ -514,7 +526,6 @@ class ImportPollBudgetTests(unittest.TestCase):
         app = GeneralDataApp.__new__(GeneralDataApp)
         app.status_var = _Var()
         app._busy = True
-        app._import_messages = []
         app._import_result = None
         app._import_exit_waits = 0
         app._import_eof = False
@@ -536,9 +547,8 @@ class ImportPollBudgetTests(unittest.TestCase):
             while pipe.messages and process.alive:
                 app._poll_import()
                 pipe.note_batch()
-                self.assertLessEqual(pipe.max_batch, 20)
+                self.assertLessEqual(pipe.max_batch, 8)
             self.assertEqual(pipe.recv_count, 101)
-            self.assertEqual(app._import_messages, [])
             self.assertTrue(app._import_result["ok"])
             showinfo.assert_not_called()
             process.alive = False
@@ -565,7 +575,6 @@ class ImportPollBudgetTests(unittest.TestCase):
             self.assertIn("3", showerror.call_args.args[1])
             self.assertIn("退出码", showerror.call_args.args[1])
         self.assertFalse(app._busy)
-        self.assertEqual(app._import_messages, [])
         self.assertIn("退出码", app.status_var.get())
         self.assertTrue(process.closed)
         self.assertIsNone(app._import_process)
@@ -586,7 +595,6 @@ class ImportPollBudgetTests(unittest.TestCase):
             while app._busy and polls < 10:
                 app._poll_import()
                 self.assertLessEqual(pipe.batch, 8)
-                self.assertEqual(app._import_messages, [])
                 pipe.note_batch()
                 polls += 1
             showerror.assert_not_called()
@@ -601,7 +609,6 @@ class ImportPollBudgetTests(unittest.TestCase):
         self.assertNotIn("step 0", app.status_var.get())
         self.assertTrue(process.closed)
         self.assertIsNone(app._import_recv)
-        self.assertEqual(app._import_messages, [])
 
     def test_mid_stream_pipe_errors_finish_instead_of_polling_forever(self):
         from origin_bridge import gui
@@ -634,7 +641,6 @@ class ImportPollBudgetTests(unittest.TestCase):
                 self.assertEqual(pipe.recv_count, 2)
                 self.assertIn("退出码", app.status_var.get())
                 self.assertTrue(process.closed)
-                self.assertEqual(app._import_messages, [])
 
     def test_non_dict_messages_are_skipped_and_the_later_result_is_kept(self):
         from origin_bridge import gui
@@ -661,7 +667,6 @@ class ImportPollBudgetTests(unittest.TestCase):
         self.assertEqual(pipe.recv_count, 5)
         self.assertEqual(app._import_result["output"]["path"], "kept.xlsx")
         self.assertIn("kept.xlsx", app.status_var.get())
-        self.assertEqual(app._import_messages, [])
         self.assertFalse(app._busy)
 
 
@@ -878,29 +883,10 @@ class _DeadThread:
         return None
 
 
-def _path_is_owned_link(path: Path) -> bool:
-    try:
-        if path.is_symlink():
-            return True
-    except OSError:
-        return True
-    probe = getattr(path, "is_junction", None)
-    if callable(probe):
-        try:
-            return bool(probe())
-        except OSError:
-            return False
-    try:
-        attributes = getattr(os.lstat(path), "st_file_attributes", 0)
-    except OSError:
-        return False
-    return bool(attributes & 0x400)
-
-
 def _release_links(path: Path) -> None:
     """Unlink junctions and symlinks without walking into their targets."""
     try:
-        linked = _path_is_owned_link(path)
+        linked = _path_is_link(path)
     except OSError:
         return
     if linked:
@@ -916,6 +902,31 @@ def _make_junction(link: Path, target: Path) -> None:
     proc = subprocess.run(["cmd", "/c", "mklink", "/J", str(link), str(target)], capture_output=True, text=True)
     if proc.returncode != 0:
         raise AssertionError((proc.stderr or proc.stdout or "mklink /J failed").strip())
+
+
+class _LegacyDirEntry:
+    """``os.DirEntry`` without ``is_junction``, as on Python 3.10 and 3.11."""
+
+    def __init__(self, path: Path, *, directory: bool, reparse: bool):
+        self.path = str(path)
+        self.name = path.name
+        self._directory = directory
+        self._reparse = reparse
+
+    def is_symlink(self) -> bool:
+        return False
+
+    def is_dir(self, *, follow_symlinks: bool = True) -> bool:
+        return self._directory
+
+    def is_file(self, *, follow_symlinks: bool = True) -> bool:
+        return not self._directory
+
+    def stat(self, *, follow_symlinks: bool = True):
+        attributes = 0x10 if self._directory else 0x20
+        if self._reparse:
+            attributes |= 0x400
+        return types.SimpleNamespace(st_file_attributes=attributes)
 
 
 def _resolved_keys(paths) -> list[str]:
@@ -1017,6 +1028,72 @@ class LinkDiscoveryTests(unittest.TestCase):
                     )
             finally:
                 _release_links(root)
+
+    @unittest.skipUnless(os.name == "nt", "junctions are a Windows directory link")
+    def test_legacy_reparse_files_stay_files_without_is_junction(self):
+        """Python 3.10/3.11 DirEntry has no ``is_junction``. This process does not run those interpreters.
+
+        A reparse file must be collected. A reparse directory is walked once.
+        A broken directory link is reported as a directory link.
+        """
+        from origin_bridge import gui
+
+        with tempfile.TemporaryDirectory() as raw:
+            root = Path(raw)
+            scan = root / "scan"
+            scan.mkdir()
+            recall = scan / "recall.csv"
+            recall.write_text("a,b\n1,2\n", encoding="utf-8")
+            local = scan / "local.csv"
+            local.write_text("a,b\n3,4\n", encoding="utf-8")
+            nested = scan / "nested"
+            nested.mkdir()
+            inner = nested / "inner.csv"
+            inner.write_text("a,b\n5,6\n", encoding="utf-8")
+            alias = scan / "nested_link"
+            _make_junction(alias, nested)
+            gone = root / "gone"
+            gone.mkdir()
+            dangling = scan / "dangling"
+            _make_junction(dangling, gone)
+            gone.rmdir()
+            entries = [
+                _LegacyDirEntry(recall, directory=False, reparse=True),
+                _LegacyDirEntry(local, directory=False, reparse=False),
+                _LegacyDirEntry(nested, directory=True, reparse=True),
+                _LegacyDirEntry(alias, directory=True, reparse=True),
+                _LegacyDirEntry(scan, directory=True, reparse=True),
+                _LegacyDirEntry(dangling, directory=True, reparse=True),
+            ]
+            self.assertFalse(hasattr(entries[0], "is_junction"))
+            root_key = os.path.normcase(str(scan.resolve()))
+            real_scandir = gui.os.scandir
+
+            def scanning(path):
+                key = os.path.normcase(str(Path(path).resolve(strict=False)))
+                if key == root_key:
+                    return iter(entries)
+                return real_scandir(path)
+
+            try:
+                with mock.patch.object(gui.os, "scandir", side_effect=scanning):
+                    found, rejected = _collect_supported([scan])
+            finally:
+                _release_links(root)
+
+        names = [path.name for path in found]
+        self.assertEqual(sorted(names), ["inner.csv", "local.csv", "recall.csv"])
+        self.assertEqual(names.count("inner.csv"), 1)
+        self.assertEqual(len(rejected), 1)
+        self.assertIn("dangling", rejected[0])
+        self.assertIn("目录链接", rejected[0])
+        self.assertNotIn("recall.csv", rejected[0])
+        print(
+            "LINK legacy_direntry=no_is_junction "
+            f"python={sys.version.split()[0]} "
+            "reparse_file=collected reparse_dir=traversed cycle=deduped broken=目录链接 "
+            "interpreter_3_10=not_executed interpreter_3_11=not_executed"
+        )
 
 
 class SnapshotContractTests(unittest.TestCase):
@@ -1184,6 +1261,119 @@ class RealTkSourceRepairTests(unittest.TestCase):
                 _shutdown_tk(app, thread)
                 app = None
                 gc.collect()
+
+    @unittest.skipUnless(os.environ.get("SPECTRA_TEST_GUI") == "1", "set SPECTRA_TEST_GUI=1 for the Tk and spawn-export integration check")
+    def test_direct_destroy_closes_export_pipe_and_reaps_after_natural_exit(self):
+        from origin_bridge import gui
+        from origin_bridge.gui import GeneralDataApp
+
+        class _LiveExport:
+            def __init__(self):
+                self._alive = True
+                self.exitcode = None
+                self.closed = False
+                self.terminated = False
+                self.join_timeouts: list[float | None] = []
+
+            def is_alive(self):
+                if self.closed:
+                    raise ValueError("process object is closed")
+                return self._alive
+
+            def join(self, timeout=None):
+                if self.closed:
+                    raise ValueError("process object is closed")
+                self.join_timeouts.append(timeout)
+                if self._alive and timeout is None:
+                    raise AssertionError("export reaper joined without a bound")
+                if self._alive and timeout:
+                    time.sleep(timeout)
+
+            def close(self):
+                if self._alive:
+                    raise ValueError("Cannot close a process while it is still running")
+                self.closed = True
+
+            def terminate(self):
+                self.terminated = True
+
+            def kill(self):
+                self.terminated = True
+
+            def finish(self):
+                self._alive = False
+                self.exitcode = 0
+
+        try:
+            app = GeneralDataApp()
+        except tk.TclError as exc:
+            self.skipTest(f"Tk display is unavailable: {exc}")
+        ctx = multiprocessing.get_context("spawn")
+        recv, send = ctx.Pipe(duplex=False)
+        send.close()
+        process = _LiveExport()
+        try:
+            app.root.withdraw()
+            with mock.patch.object(gui.messagebox, "showwarning") as showwarning:
+                app._busy = True
+                app._on_close()
+                self.assertTrue(app.root.winfo_exists())
+                showwarning.assert_called_once()
+                self.assertIn("任务进行中", showwarning.call_args.args[0])
+            fired = []
+            app._import_process = process
+            app._import_recv = recv
+            app._after(30, lambda: fired.append("poll"))
+            scheduled = app._poll_after
+            self.assertIsNotNone(scheduled)
+            cancelled = []
+            real_cancel = app.root.after_cancel
+
+            def spy_cancel(after_id, *args, **kwargs):
+                cancelled.append(after_id)
+                return real_cancel(after_id, *args, **kwargs)
+
+            app.root.after_cancel = spy_cancel
+            app.root.destroy()
+            self.assertIsNone(app._poll_after)
+            self.assertIsNone(app._hook_after)
+            self.assertIn(scheduled, cancelled)
+            self.assertEqual(fired, [])
+            self.assertTrue(recv.closed)
+            self.assertIsNone(app._import_recv)
+            self.assertIsNone(app._import_process)
+            self.assertTrue(process.is_alive())
+            self.assertFalse(process.closed)
+            self.assertFalse(process.terminated)
+            deadline = time.monotonic() + 2
+            while not process.join_timeouts and time.monotonic() < deadline:
+                time.sleep(0.01)
+            self.assertTrue(process.join_timeouts)
+            self.assertTrue(all(timeout is not None and timeout <= 0.2 for timeout in process.join_timeouts))
+            process.finish()
+            deadline = time.monotonic() + 2
+            while not process.closed and time.monotonic() < deadline:
+                time.sleep(0.01)
+            self.assertTrue(process.closed)
+            self.assertEqual(process.exitcode, 0)
+            self.assertFalse(process.terminated)
+            self.assertEqual(fired, [])
+            print(
+                "DESTROY direct=export after_cleared=1 pipe_closed=1 "
+                f"reaper_join_timeouts={process.join_timeouts} process_closed_after_exit=1 terminated=0"
+            )
+        finally:
+            process.finish()
+            deadline = time.monotonic() + 2
+            while not process.closed and time.monotonic() < deadline:
+                time.sleep(0.01)
+            try:
+                recv.close()
+            except OSError:
+                pass
+            _shutdown_tk(app)
+            app = None
+            gc.collect()
 
     @unittest.skipUnless(os.environ.get("SPECTRA_TEST_GUI") == "1", "set SPECTRA_TEST_GUI=1 for the Tk and spawn-export integration check")
     def test_error_row_clears_controls_and_removed_plots_do_not_return(self):
@@ -1364,7 +1554,10 @@ class RealTkSourceRepairTests(unittest.TestCase):
                     showerror.assert_not_called()
                 loaded_sheets = [values[1] for _iid, values in _tree_rows(app)]
                 self.assertEqual(loaded_sheets, ["gamma", "alpha", "beta"])
-                self.assertLess(app._summaries.inspect_calls, calls_before + 3)
+                # The first inspect requested header "auto". Saved sheet options
+                # store the resolved header boolean, so this reload's fingerprint
+                # misses once for the workbook. All three sheets share that read.
+                self.assertEqual(app._summaries.inspect_calls, calls_before + 1)
                 self.assertLessEqual(len(app._summaries._slots), slots_before)
                 for sheet, title in (("gamma", "G-PLAN"), ("alpha", "A-PLAN"), ("beta", "B-PLAN")):
                     _select_path_sheet(app, "book.xlsx", sheet)
