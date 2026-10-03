@@ -19,6 +19,7 @@ import tkinter as tk
 from typing import Any
 
 from .batch_config import (
+    allocate_record_path,
     config_path_for,
     find_config_for_record,
     load_batch_config,
@@ -40,6 +41,8 @@ _UI_MESSAGE_BUDGET = 20
 _IMPORT_MESSAGE_BUDGET = 8
 _IMPORT_FRAME_SECONDS = 0.012
 _IMPORT_EXIT_POLLS = 2
+_DETAIL_CELL_LIMIT = 180
+_Y_ERROR_NEEDS_NAME = "误差列需要Y使用原列名"
 
 
 def _normalized_path(path: str | Path) -> str:
@@ -144,7 +147,14 @@ def build_global_plot(*, scope: str, kind: str, explicit_x: str, explicit_y: str
     if error_text:
         if len(y_tokens) != 1:
             raise ValueError("误差列只在明确选择了单个 Y 列时可用。")
-        plot["y_error"] = {y_tokens[0]: _column_token(error_text)}
+        y_token = y_tokens[0]
+        if isinstance(_column_token(y_token), int):
+            raise ValueError(
+                f"{_Y_ERROR_NEEDS_NAME}。误差映射的键必须是所选 Y 的原始列名，不能是列号；"
+                "请把 Y 改成列名后再创建或保存批次。没有误差列时，Y 仍可以用列号。"
+                "不会用预览里的列名代替这个数字。"
+            )
+        plot["y_error"] = {y_token: _column_token(error_text)}
     return plot
 
 
@@ -160,6 +170,76 @@ def _format_task_status(event: dict[str, Any]) -> str:
     if event.get("pdf_status") == "failed":
         text += "（PDF 失败）"
     return text
+
+
+def _detail_cell(text: str) -> str:
+    compact = " ".join(str(text).split())
+    if len(compact) <= _DETAIL_CELL_LIMIT:
+        return compact
+    return compact[: _DETAIL_CELL_LIMIT - 1] + "…"
+
+
+def _release_cancel_event(cancel: Any) -> None:
+    """Drop a cancel Event that never reached a child, and the handles it owns."""
+    if cancel is None:
+        return
+    objects: list[Any] = [getattr(cancel, "_flag", None)]
+    cond = getattr(cancel, "_cond", None)
+    if cond is not None:
+        objects.extend([
+            getattr(cond, "_lock", None),
+            getattr(cond, "_sleeping_count", None),
+            getattr(cond, "_wait_semaphore", None),
+            getattr(cond, "_woken_count", None),
+        ])
+    for obj in objects:
+        if obj is None:
+            continue
+        try:
+            if getattr(obj, "_semlock", None) is not None:
+                obj._semlock = None
+        except Exception:
+            continue
+    try:
+        cancel._flag = None
+        cancel._cond = None
+    except Exception:
+        return
+
+
+def widget_in_client(root: Any, widget: Any) -> dict[str, Any]:
+    """Measure a widget against the root client after layout has settled."""
+    root.update_idletasks()
+    origin_x = int(root.winfo_rootx())
+    origin_y = int(root.winfo_rooty())
+    x = int(widget.winfo_rootx()) - origin_x
+    y = int(widget.winfo_rooty()) - origin_y
+    width = int(widget.winfo_width())
+    height = int(widget.winfo_height())
+    client_w = int(root.winfo_width())
+    client_h = int(root.winfo_height())
+    inside = (
+        width > 1
+        and height > 1
+        and x >= -1
+        and y >= -1
+        and x + width <= client_w + 1
+        and y + height <= client_h + 1
+    )
+    state = ""
+    try:
+        state = str(widget.cget("state"))
+    except tk.TclError:
+        state = ""
+    return {
+        "x": x,
+        "y": y,
+        "width": width,
+        "height": height,
+        "inside": inside,
+        "state": state,
+        "client": [client_w, client_h],
+    }
 
 
 def _format_task_detail(event: dict[str, Any]) -> str:
@@ -404,7 +484,8 @@ class GeneralDataApp:
     def __init__(self, initial_files: list[Path] | None = None) -> None:
         self.root = tk.Tk()
         self.root.title("数据 → Origin 工程")
-        self.root.minsize(1100, 860)
+        self.root.minsize(960, 620)
+        self.root.geometry("1100x720")
 
         self._paths: list[Path] = []
         self._path_keys: list[str] = []
@@ -439,7 +520,12 @@ class GeneralDataApp:
         self._iids_by_path: dict[str, list[str]] = {}
         self._pending_outcomes: deque[tuple[dict[str, Any], str]] = deque()
         self._pending_listed: deque[dict[str, Any]] = deque()
-        self._suppress_preview = False
+        self._name_counts: dict[str, int] = {}
+        self._task_sources: dict[str, str] = {}
+        self._task_details: dict[str, str] = {}
+        self._batch_warnings: list[str] = []
+        self._detail_window: tk.Toplevel | None = None
+        self._detail_box: tk.Text | None = None
         self._job_terminal = False
         self._job_error: str | None = None
         self._done_message: dict[str, Any] | None = None
@@ -475,6 +561,7 @@ class GeneralDataApp:
         self.status_var = tk.StringVar(
             value="默认每个来源一个文件。添加后只发现路径；预览选中的来源。合并模式才会逐个检查全部来源。"
         )
+        self.selection_detail_var = tk.StringVar(value="选中一行后，这里显示完整路径。")
 
         self._build()
         self.root.protocol("WM_DELETE_WINDOW", self._on_close)
@@ -496,11 +583,11 @@ class GeneralDataApp:
         return widget
 
     def _build(self) -> None:
-        outer = ttk.Frame(self.root, padding=10)
+        outer = ttk.Frame(self.root, padding=8)
         outer.pack(fill=tk.BOTH, expand=True)
 
         top = ttk.Frame(outer)
-        top.pack(fill=tk.X)
+        top.pack(side=tk.TOP, fill=tk.X)
         ttk.Label(top, text="支持文本表格、Excel、JSON 和 JSONL；可把文件或文件夹拖到窗口。").pack(side=tk.LEFT, fill=tk.X, expand=True)
         for label, command in (
             ("添加文件", self.add_files),
@@ -509,24 +596,70 @@ class GeneralDataApp:
         ):
             self._track(ttk.Button(top, text=label, command=command)).pack(side=tk.LEFT, padx=(6, 0))
 
-        source_frame = ttk.LabelFrame(outer, text="数据表和工作表", padding=5)
-        source_frame.pack(fill=tk.BOTH, expand=True, pady=(8, 0))
+        self.status_label = ttk.Label(outer, textvariable=self.status_var, anchor=tk.W, justify=tk.LEFT)
+        self.status_label.pack(side=tk.BOTTOM, fill=tk.X, pady=(4, 0))
+        self.identity_label = ttk.Entry(outer, textvariable=self.selection_detail_var, state="readonly")
+        self.identity_label.pack(side=tk.BOTTOM, fill=tk.X)
+
+        actions = ttk.Frame(outer)
+        actions.pack(side=tk.BOTTOM, fill=tk.X, pady=(4, 0))
+        self.continue_button = self._track(ttk.Button(actions, text="继续批次…", command=self.continue_batch))
+        self.continue_button.pack(side=tk.LEFT, padx=(0, 5))
+        self.retry_button = self._track(ttk.Button(actions, text="重试失败项…", command=self.retry_failed_batch))
+        self.retry_button.pack(side=tk.LEFT, padx=(0, 5))
+        self.export_button = self._track(ttk.Button(actions, text="创建文件…", command=self.export_data))
+        self.export_button.pack(side=tk.LEFT)
+        self.stop_button = ttk.Button(actions, text="停止后续", command=self.stop_later_tasks)
+        self.stop_button.pack(side=tk.LEFT, padx=(8, 0))
+        self.detail_button = ttk.Button(actions, text="查看完整详情", command=self.show_selected_detail)
+        self.detail_button.pack(side=tk.LEFT, padx=(8, 0))
+
+        format_frame = ttk.Frame(outer)
+        format_frame.pack(side=tk.BOTTOM, fill=tk.X, pady=(4, 0))
+        ttk.Label(format_frame, text="方式").pack(side=tk.LEFT)
+        self._track(ttk.Radiobutton(
+            format_frame, text="每个来源一个文件", value="per_file", variable=self.layout_var, command=self._layout_changed,
+        )).pack(side=tk.LEFT, padx=(6, 0))
+        self._track(ttk.Radiobutton(
+            format_frame, text="合并为一个工程", value="unified", variable=self.layout_var, command=self._layout_changed,
+        )).pack(side=tk.LEFT, padx=(6, 10))
+        self._track(ttk.Radiobutton(format_frame, text="OPJU", value="opju", variable=self.format_var, command=self._format_changed)).pack(side=tk.LEFT)
+        self._track(ttk.Radiobutton(format_frame, text="XLSX", value="xlsx", variable=self.format_var, command=self._format_changed)).pack(side=tk.LEFT, padx=(6, 0))
+        self.keep_open_check = self._track(ttk.Checkbutton(format_frame, text="完成后保持打开", variable=self.keep_open_var))
+        self.keep_open_check.pack(side=tk.LEFT, padx=(8, 0))
+        self.pdf_check = self._track(ttk.Checkbutton(format_frame, text="每图 PDF", variable=self.pdf_var))
+        self.pdf_check.pack(side=tk.LEFT, padx=(8, 0))
+        self.overwrite_check = self._track(ttk.Checkbutton(format_frame, text="覆盖已有输出", variable=self.batch_overwrite_var))
+        self.overwrite_check.pack(side=tk.LEFT, padx=(8, 0))
+
+        self.main_notebook = ttk.Notebook(outer)
+        self.main_notebook.pack(side=tk.TOP, fill=tk.BOTH, expand=True, pady=(6, 0))
+        batch_page = ttk.Frame(self.main_notebook, padding=(0, 4, 0, 0))
+        preview_page = ttk.Frame(self.main_notebook, padding=(0, 4, 0, 0))
+        self.main_notebook.add(batch_page, text="批量")
+        self.main_notebook.add(preview_page, text="预览与单表")
+        batch_page.columnconfigure(0, weight=1)
+        batch_page.rowconfigure(0, weight=1)
+        batch_page.rowconfigure(3, weight=1)
+
+        source_frame = ttk.LabelFrame(batch_page, text="数据表和工作表", padding=4)
+        source_frame.grid(row=0, column=0, sticky="nsew")
         self.table_tree = ttk.Treeview(
             source_frame,
             columns=("source", "sheet", "rows", "columns", "state"),
             show="headings",
-            height=6,
+            height=4,
             selectmode="browse",
         )
         for column, heading, width, anchor in (
-            ("source", "文件", 360, tk.W),
-            ("sheet", "工作表", 140, tk.W),
+            ("source", "文件", 220, tk.W),
+            ("sheet", "工作表", 120, tk.W),
             ("rows", "行数", 70, tk.E),
             ("columns", "列数", 70, tk.E),
-            ("state", "状态", 280, tk.W),
+            ("state", "状态", 220, tk.W),
         ):
             self.table_tree.heading(column, text=heading)
-            self.table_tree.column(column, width=width, anchor=anchor, stretch=column == "source")
+            self.table_tree.column(column, width=width, anchor=anchor, stretch=column == "state")
         source_scroll = ttk.Scrollbar(source_frame, orient=tk.VERTICAL, command=self.table_tree.yview)
         self.table_tree.configure(yscrollcommand=source_scroll.set)
         self.table_tree.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
@@ -534,8 +667,8 @@ class GeneralDataApp:
         self.table_tree.bind("<<TreeviewSelect>>", self._on_table_selection)
         self.table_tree.bind("<Double-1>", lambda _event: self.preview_selected())
 
-        read_frame = ttk.LabelFrame(outer, text="读取选项", padding=(7, 5))
-        read_frame.pack(fill=tk.X, pady=(7, 0))
+        read_frame = ttk.LabelFrame(batch_page, text="读取选项", padding=(7, 3))
+        read_frame.grid(row=1, column=0, sticky="ew", pady=(4, 0))
         ttk.Label(read_frame, text="标题行").pack(side=tk.LEFT)
         self._track(ttk.Combobox(read_frame, state="readonly", width=10, textvariable=self.header_var, values=("自动", "有标题行", "无标题行"))).pack(side=tk.LEFT, padx=(4, 12))
         ttk.Label(read_frame, text="跳过开头行").pack(side=tk.LEFT)
@@ -545,8 +678,8 @@ class GeneralDataApp:
         self._track(ttk.Button(read_frame, text="重新读取", command=self.reload_inputs)).pack(side=tk.LEFT)
         ttk.Label(read_frame, text="修改这些设置后重新读取，计划会保存实际读取选项。", foreground="#555555").pack(side=tk.LEFT, padx=(12, 0))
 
-        preview_box = ttk.LabelFrame(outer, text="列信息与数据预览", padding=5)
-        preview_box.pack(fill=tk.BOTH, expand=True, pady=(7, 0))
+        preview_box = ttk.LabelFrame(preview_page, text="列信息与数据预览", padding=5)
+        preview_box.pack(fill=tk.BOTH, expand=True)
         preview_panes = ttk.Panedwindow(preview_box, orient=tk.HORIZONTAL)
         preview_panes.pack(fill=tk.BOTH, expand=True)
         meta_frame = ttk.Frame(preview_panes)
@@ -570,8 +703,8 @@ class GeneralDataApp:
         sample_frame.rowconfigure(0, weight=1)
         sample_frame.columnconfigure(0, weight=1)
 
-        plot_box = ttk.LabelFrame(outer, text="当前表的绘图设置（仅“合并为一个工程”时写入计划）", padding=(7, 5))
-        plot_box.pack(fill=tk.X, pady=(7, 0))
+        plot_box = ttk.LabelFrame(preview_page, text="当前表的绘图设置（仅“合并为一个工程”时写入计划）", padding=(7, 5))
+        plot_box.pack(fill=tk.X, pady=(6, 0))
         row = ttk.Frame(plot_box)
         row.pack(fill=tk.X)
         ttk.Label(row, text="图形").pack(side=tk.LEFT)
@@ -585,7 +718,7 @@ class GeneralDataApp:
         self.error_combo.pack(side=tk.LEFT, padx=(4, 0))
         y_frame = ttk.Frame(plot_box)
         y_frame.pack(fill=tk.X, pady=(4, 0))
-        self.y_list = tk.Listbox(y_frame, selectmode=tk.MULTIPLE, height=4, exportselection=False)
+        self.y_list = tk.Listbox(y_frame, selectmode=tk.MULTIPLE, height=3, exportselection=False)
         self.y_list.pack(side=tk.LEFT, fill=tk.X, expand=True)
         self.y_list.bind("<<ListboxSelect>>", self._update_error_state)
         y_scroll = ttk.Scrollbar(y_frame, orient=tk.VERTICAL, command=self.y_list.yview)
@@ -597,15 +730,15 @@ class GeneralDataApp:
             ttk.Label(label_row, text=label).pack(side=tk.LEFT)
             self._track(ttk.Entry(label_row, textvariable=var, width=width)).pack(side=tk.LEFT, padx=(4, 12))
 
-        batch_box = ttk.LabelFrame(outer, text="批量绘图与输出", padding=(7, 5))
-        batch_box.pack(fill=tk.X, pady=(7, 0))
-        scope = ttk.Label(
+        batch_box = ttk.LabelFrame(batch_page, text="批量绘图与输出", padding=(7, 3))
+        batch_box.grid(row=2, column=0, sticky="ew", pady=(4, 0))
+        self.batch_scope_label = ttk.Label(
             batch_box,
-            text="生效范围：每一个文件、每一张表。自动按每张表自己的建议；明确列对不上时该文件失败，不会改用预览里的其他列。全数字按列号。",
-            wraplength=1040,
+            text="生效范围：每一个文件、每一张表。自动按每张表自己的建议；明确列对不上时该文件失败，不会改用预览里的其他列。全数字按列号。误差列需要Y使用原列名，不能写列号；没有误差列时 Y 仍可用列号。",
+            wraplength=980,
             justify=tk.LEFT,
         )
-        scope.pack(fill=tk.X)
+        self.batch_scope_label.pack(fill=tk.X)
         batch_row = ttk.Frame(batch_box)
         batch_row.pack(fill=tk.X, pady=(4, 0))
         ttk.Label(batch_row, text="列选择").pack(side=tk.LEFT)
@@ -636,61 +769,36 @@ class GeneralDataApp:
         self.explicit_error_entry = self._track(ttk.Entry(explicit_row, textvariable=self.explicit_error_var, width=18))
         self.explicit_error_entry.pack(side=tk.LEFT, padx=(4, 0))
 
-        bottom = ttk.Frame(outer)
-        bottom.pack(fill=tk.X, pady=(8, 0))
-        format_frame = ttk.Frame(bottom)
-        format_frame.pack(side=tk.LEFT, fill=tk.X, expand=True)
-        ttk.Label(format_frame, text="方式").pack(side=tk.LEFT)
-        self._track(ttk.Radiobutton(
-            format_frame, text="每个来源一个文件", value="per_file", variable=self.layout_var, command=self._layout_changed,
-        )).pack(side=tk.LEFT, padx=(6, 0))
-        self._track(ttk.Radiobutton(
-            format_frame, text="合并为一个工程", value="unified", variable=self.layout_var, command=self._layout_changed,
-        )).pack(side=tk.LEFT, padx=(6, 10))
-        self._track(ttk.Radiobutton(format_frame, text="OPJU", value="opju", variable=self.format_var, command=self._format_changed)).pack(side=tk.LEFT)
-        self._track(ttk.Radiobutton(format_frame, text="XLSX", value="xlsx", variable=self.format_var, command=self._format_changed)).pack(side=tk.LEFT, padx=(6, 0))
-        self.keep_open_check = self._track(ttk.Checkbutton(format_frame, text="完成后保持打开", variable=self.keep_open_var))
-        self.keep_open_check.pack(side=tk.LEFT, padx=(8, 0))
-        self.pdf_check = self._track(ttk.Checkbutton(format_frame, text="每图 PDF", variable=self.pdf_var))
-        self.pdf_check.pack(side=tk.LEFT, padx=(8, 0))
-        self.overwrite_check = self._track(ttk.Checkbutton(format_frame, text="覆盖已有输出", variable=self.batch_overwrite_var))
-        self.overwrite_check.pack(side=tk.LEFT, padx=(8, 0))
+        legacy = ttk.Frame(preview_page)
+        legacy.pack(fill=tk.X, pady=(6, 0))
+        self._track(ttk.Button(legacy, text="预览选中", command=self.preview_selected)).pack(side=tk.LEFT, padx=(0, 5))
+        self._track(ttk.Button(legacy, text="加载计划 JSON", command=self.load_plan)).pack(side=tk.LEFT, padx=(0, 5))
+        self._track(ttk.Button(legacy, text="保存计划 JSON", command=self.save_plan)).pack(side=tk.LEFT, padx=(0, 5))
+        self._track(ttk.Button(legacy, text="批量谱线模式", command=self.open_spectra_gui)).pack(side=tk.LEFT, padx=(0, 5))
 
-        actions = ttk.Frame(outer)
-        actions.pack(fill=tk.X, pady=(6, 0))
-        self._track(ttk.Button(actions, text="预览选中", command=self.preview_selected)).pack(side=tk.LEFT, padx=(0, 5))
-        self._track(ttk.Button(actions, text="加载计划 JSON", command=self.load_plan)).pack(side=tk.LEFT, padx=(0, 5))
-        self._track(ttk.Button(actions, text="保存计划 JSON", command=self.save_plan)).pack(side=tk.LEFT, padx=(0, 5))
-        self._track(ttk.Button(actions, text="继续批次…", command=self.continue_batch)).pack(side=tk.LEFT, padx=(0, 5))
-        self._track(ttk.Button(actions, text="重试失败项…", command=self.retry_failed_batch)).pack(side=tk.LEFT, padx=(0, 5))
-        self._track(ttk.Button(actions, text="批量谱线模式", command=self.open_spectra_gui)).pack(side=tk.LEFT, padx=(0, 5))
-        self.export_button = self._track(ttk.Button(actions, text="创建文件…", command=self.export_data))
-        self.export_button.pack(side=tk.LEFT)
-        self.stop_button = ttk.Button(actions, text="停止后续", command=self.stop_later_tasks)
-        self.stop_button.pack(side=tk.LEFT, padx=(8, 0))
-
-        task_frame = ttk.LabelFrame(outer, text="批量任务", padding=5)
-        task_frame.pack(fill=tk.BOTH, expand=True, pady=(7, 0))
+        task_frame = ttk.LabelFrame(batch_page, text="批量任务", padding=4)
+        task_frame.grid(row=3, column=0, sticky="nsew", pady=(4, 0))
         self.task_tree = ttk.Treeview(
             task_frame,
             columns=("source", "status", "detail"),
             show="headings",
-            height=5,
+            height=4,
         )
-        for column, heading, width in (
-            ("source", "来源", 420),
-            ("status", "状态", 140),
-            ("detail", "错误或 PDF", 460),
+        for column, heading, width, stretch in (
+            ("source", "来源", 180, False),
+            ("status", "状态", 120, False),
+            ("detail", "错误或 PDF", 360, True),
         ):
             self.task_tree.heading(column, text=heading)
-            self.task_tree.column(column, width=width, anchor=tk.W, stretch=column != "status")
+            self.task_tree.column(column, width=width, anchor=tk.W, stretch=stretch, minwidth=80)
         task_scroll = ttk.Scrollbar(task_frame, orient=tk.VERTICAL, command=self.task_tree.yview)
         self.task_tree.configure(yscrollcommand=task_scroll.set)
         self.task_tree.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
         task_scroll.pack(side=tk.RIGHT, fill=tk.Y)
+        self.task_tree.bind("<<TreeviewSelect>>", self._on_task_selection)
+        self.task_tree.bind("<Double-1>", self._on_task_double_click)
         self._format_changed()
-
-        ttk.Label(outer, textvariable=self.status_var, wraplength=1060, justify=tk.LEFT).pack(fill=tk.X, pady=(8, 0))
+        self._sync_stop_button()
 
     def _hook_drop(self) -> None:
         self._hook_after = None
@@ -794,6 +902,7 @@ class GeneralDataApp:
                 kept_keys.append(key)
         self._paths = kept_paths
         self._path_keys = kept_keys
+        self._refresh_listed_labels()
         kept_tables: list[dict[str, Any]] = []
         kept_table_keys: list[str] = []
         for table, key in zip(self._tables, self._table_keys):
@@ -1217,6 +1326,7 @@ class GeneralDataApp:
             self._paths.append(Path(path))
             self._path_keys.append(key)
             self._remember_key(path, key)
+        self._reindex_source_names()
 
     def _apply_outcome(self, outcome: dict[str, Any], update: str) -> None:
         path = str(outcome.get("path") or "")
@@ -1414,14 +1524,42 @@ class GeneralDataApp:
         except tk.TclError:
             return
 
+    def _reindex_source_names(self) -> None:
+        counts: dict[str, int] = {}
+        for path in self._paths:
+            name = Path(path).name
+            counts[name] = counts.get(name, 0) + 1
+        self._name_counts = counts
+
+    def _refresh_listed_labels(self) -> None:
+        self._reindex_source_names()
+        for iid, table in list(self._tables_by_iid.items()):
+            if not self.table_tree.exists(iid):
+                continue
+            values = list(self.table_tree.item(iid, "values"))
+            if not values:
+                continue
+            path = str((table.get("source") or {}).get("path") or "")
+            values[0] = self._display_source(path)
+            self.table_tree.item(iid, values=values)
+
+    def _display_source(self, path: str) -> str:
+        text = str(path or "")
+        name = Path(text).name or text
+        if int(self._name_counts.get(name, 1) or 1) > 1:
+            parent = Path(text).parent.name
+            return f"{name} · {parent}" if parent else name
+        return name
+
     def _row_values(self, table: dict[str, Any]) -> tuple[Any, ...]:
         source = table.get("source") or {}
+        label = self._display_source(str(source.get("path", "")))
         if table.get("error"):
-            return (source.get("path", ""), "", "错误", "", table.get("error", ""))
+            return (label, "", "错误", "", table.get("error", ""))
         if table.get("pending"):
-            return (source.get("path", ""), "", "", "", "未预览")
+            return (label, "", "", "", "未预览")
         return (
-            source.get("path", ""),
+            label,
             source.get("sheet") or "",
             table.get("n_rows", ""),
             len(table.get("columns") or []),
@@ -1498,13 +1636,9 @@ class GeneralDataApp:
                 chosen = current[0]
             else:
                 chosen = children[0]
-        self._suppress_preview = True
-        try:
-            self.table_tree.selection_set(chosen)
-            self.table_tree.focus(chosen)
-            self._select_table(self._tables_by_iid[chosen])
-        finally:
-            self._suppress_preview = False
+        self.table_tree.selection_set(chosen)
+        self.table_tree.focus(chosen)
+        self._select_table(self._tables_by_iid[chosen])
 
     @staticmethod
     def _default_plot(table: dict[str, Any]) -> dict[str, Any]:
@@ -1537,6 +1671,8 @@ class GeneralDataApp:
     def _select_table(self, table: dict[str, Any] | None) -> None:
         self._current_key = self._table_identity(table["source"]) if table else None
         self._current_table = table
+        if table is not None:
+            self.selection_detail_var.set(str((table.get("source") or {}).get("path") or ""))
         self._show_table(table)
 
     def _clear_source_controls(self) -> None:
@@ -1854,6 +1990,7 @@ class GeneralDataApp:
         try:
             from .batch import build_batch_request
 
+            record_path = allocate_record_path(output_dir)
             request = build_batch_request(
                 self._paths,
                 output_dir,
@@ -1866,6 +2003,7 @@ class GeneralDataApp:
                 keep_open=bool(self.keep_open_var.get()) if fmt == "opju" else False,
                 resume=False,
                 retry_task_ids=[],
+                record_path=record_path,
             )
         except Exception as exc:
             messagebox.showerror("无法创建批量请求", str(exc), parent=self.root)
@@ -1892,10 +2030,11 @@ class GeneralDataApp:
     def _launch_batch(self, request: dict[str, Any], *, name: str) -> None:
         if self._busy:
             return
+        config_path = config_path_for(request["record_path"])
         try:
             json.dumps(request, ensure_ascii=False)
             save_batch_config(
-                config_path_for(request["record_path"]),
+                config_path,
                 name=name,
                 record_path=request["record_path"],
                 inputs=list(request["inputs"]),
@@ -1909,9 +2048,30 @@ class GeneralDataApp:
         try:
             self._start_batch_process(request)
         except Exception as exc:
-            self._set_busy(False)
+            self._forget_unstarted_config(config_path, request["record_path"])
+            self._import_cancel = None
+            self._import_process = None
+            self._import_recv = None
+            if self._busy:
+                self._set_busy(False)
             messagebox.showerror("无法启动批量导出", str(exc), parent=self.root)
-            self.status_var.set("无法启动后台批量导出。")
+            self.status_var.set("无法启动后台批量导出。上一批的记录和配置没有被替换。")
+
+    def _forget_unstarted_config(self, config_path: Path, record_path: str | Path) -> None:
+        """Remove a config written for a batch whose worker never started.
+
+        An existing record means this path already belongs to a batch that can
+        be resumed, so the config stays paired with it.
+        """
+        record = Path(record_path)
+        if record.exists() or Path(str(record) + ".bak").exists() or Path(str(record) + ".previous").exists():
+            return
+        for candidate in (Path(config_path), Path(str(config_path) + ".tmp")):
+            try:
+                if candidate.is_file():
+                    candidate.unlink()
+            except OSError:
+                continue
 
     def _start_batch_process(self, request: dict[str, Any]) -> None:
         context = multiprocessing.get_context("spawn")
@@ -1920,11 +2080,22 @@ class GeneralDataApp:
         drive_spec = os.environ.pop("ORI_GUI_BATCH_DRIVE", None)
         process = context.Process(target=batch_worker, args=(send_conn, request, cancel))
         try:
-            process.start()
-        except Exception:
-            recv_conn.close()
-            send_conn.close()
-            raise
+            try:
+                process.start()
+            except Exception:
+                for conn in (recv_conn, send_conn):
+                    try:
+                        conn.close()
+                    except OSError:
+                        pass
+                _release_cancel_event(cancel)
+                cancel = None
+                self._import_cancel = None
+                try:
+                    process.close()
+                except (ValueError, OSError):
+                    pass
+                raise
         finally:
             if drive_spec is not None:
                 os.environ["ORI_GUI_BATCH_DRIVE"] = drive_spec
@@ -1937,12 +2108,15 @@ class GeneralDataApp:
         self._import_exit_waits = 0
         self._import_eof = False
         self._batch_terminal = False
+        self._batch_warnings = []
         self._clear_task_rows()
         self._set_busy(True)
         self._after(100, self._poll_import)
 
     def _clear_task_rows(self) -> None:
         self._task_iids.clear()
+        self._task_sources.clear()
+        self._task_details.clear()
         children = self.task_tree.get_children()
         if children:
             self.task_tree.delete(*children)
@@ -2046,6 +2220,10 @@ class GeneralDataApp:
         self._clear_listed_sources()
         self._paths = []
         self._path_keys = []
+        self._name_counts = {}
+        for item in request["inputs"]:
+            name = Path(item).name
+            self._name_counts[name] = self._name_counts.get(name, 0) + 1
         self._source_errors.clear()
         self._loaded_plan = None
         self._plan_base_dir = None
@@ -2124,16 +2302,8 @@ class GeneralDataApp:
         if not self._paths and self._loaded_plan is None:
             messagebox.showinfo("没有数据", "请先添加数据文件或加载导入计划。", parent=self.root)
             return
-        if fmt == "opju":
-            try:
-                import spectra_to_origin as sto
-
-                if sto.origin_process_running():
-                    messagebox.showwarning("请先关闭 Origin", "检测到 Origin 正在运行。请先保存并关闭当前 Origin 工程，再重新创建文件；程序不会重置当前会话。", parent=self.root)
-                    return
-            except Exception as exc:
-                messagebox.showerror("Origin 状态检查失败", str(exc), parent=self.root)
-                return
+        if fmt == "opju" and not self._confirm_origin_idle():
+            return
         raw_output = filedialog.asksaveasfilename(
             parent=self.root,
             title="选择输出文件",
@@ -2271,7 +2441,9 @@ class GeneralDataApp:
             return
         task_id = str(event.get("task_id") or event.get("source") or "")
         source = str(event.get("source") or "")
-        values = (source, _format_task_status(event), _format_task_detail(event))
+        detail = _format_task_detail(event)
+        document = self._task_document(event, detail)
+        values = (self._task_label(source), _format_task_status(event), _detail_cell(detail))
         iid = self._task_iids.get(task_id)
         if iid and tree.exists(iid):
             tree.item(iid, values=values)
@@ -2280,6 +2452,9 @@ class GeneralDataApp:
             iid = f"t{self._task_seq}"
             tree.insert("", tk.END, iid=iid, values=values)
             self._task_iids[task_id] = iid
+        self._task_sources[iid] = source
+        self._task_details[iid] = document
+        self._disambiguate_task_labels(Path(source).name)
         tree.see(iid)
         index = event.get("index")
         count = event.get("count")
@@ -2491,6 +2666,7 @@ class GeneralDataApp:
                 _resolve_plan_path(item["source"]["path"], self._plan_base_dir) for item in plan["tables"]
             ))
             self._path_keys = [self._cached_path_key(path) for path in self._paths]
+            self._reindex_source_names()
             self._plots.clear()
             self._column_labels.clear()
             self._fingerprints.clear()
@@ -2554,6 +2730,107 @@ class GeneralDataApp:
             pass
         self._sync_stop_button()
 
+    def _task_label(self, source: str) -> str:
+        name = Path(source).name or source
+        twins = [path for path in self._task_sources.values() if Path(path).name == name]
+        if source not in twins:
+            twins.append(source)
+        if len(twins) > 1:
+            parent = Path(source).parent.name
+            return f"{name} · {parent}" if parent else name
+        return name
+
+    def _disambiguate_task_labels(self, name: str) -> None:
+        twins = [iid for iid, path in self._task_sources.items() if Path(path).name == name]
+        if len(twins) < 2:
+            return
+        for iid in twins:
+            if not self.task_tree.exists(iid):
+                continue
+            values = list(self.task_tree.item(iid, "values"))
+            if not values:
+                continue
+            values[0] = self._task_label(self._task_sources.get(iid, ""))
+            self.task_tree.item(iid, values=values)
+
+    def _task_document(self, event: dict[str, Any], detail: str) -> str:
+        source = str(event.get("source") or "")
+        lines = [f"来源：{source}", f"文件名：{Path(source).name}"]
+        task_id = event.get("task_id")
+        if task_id:
+            lines.append(f"任务：{task_id}")
+        output = event.get("output")
+        if isinstance(output, dict):
+            output = output.get("path")
+        if output:
+            lines.append(f"输出：{output}")
+        if detail:
+            lines.append(detail)
+        return "\n".join(lines)
+
+    def _on_task_selection(self, _event=None) -> None:
+        selected = self.task_tree.selection()
+        if not selected:
+            return
+        source = self._task_sources.get(selected[0], "")
+        if source:
+            self.selection_detail_var.set(source)
+
+    def _on_task_double_click(self, _event=None) -> None:
+        self.show_selected_detail()
+
+    def _selected_detail_text(self) -> str:
+        parts: list[str] = []
+        selected = self.task_tree.selection()
+        if selected:
+            parts.append(self._task_details.get(selected[0], ""))
+        else:
+            source_sel = self.table_tree.selection()
+            if source_sel:
+                table = self._tables_by_iid.get(source_sel[0]) or {}
+                path = str((table.get("source") or {}).get("path") or "")
+                if path:
+                    parts.append(f"来源：{path}\n文件名：{Path(path).name}")
+                if table.get("error"):
+                    parts.append(str(table.get("error")))
+        warnings = [str(item) for item in (self._batch_warnings or []) if str(item).strip()]
+        if warnings:
+            parts.append("批次提示：\n" + "\n".join(warnings))
+        return "\n\n".join(part for part in parts if part).strip()
+
+    def show_selected_detail(self) -> None:
+        text = self._selected_detail_text()
+        if not text:
+            messagebox.showinfo("没有详情", "请先在来源或任务列表中选择一行。", parent=self.root)
+            return
+        self._open_readonly_detail(text)
+
+    def _open_readonly_detail(self, text: str) -> None:
+        existing = getattr(self, "_detail_window", None)
+        if existing is not None:
+            try:
+                if existing.winfo_exists():
+                    existing.destroy()
+            except tk.TclError:
+                pass
+        window = tk.Toplevel(self.root)
+        window.title("详情")
+        window.geometry("720x420")
+        window.transient(self.root)
+        frame = ttk.Frame(window, padding=6)
+        frame.pack(fill=tk.BOTH, expand=True)
+        box = tk.Text(frame, wrap="word")
+        scroll = ttk.Scrollbar(frame, orient=tk.VERTICAL, command=box.yview)
+        box.configure(yscrollcommand=scroll.set)
+        box.grid(row=0, column=0, sticky="nsew")
+        scroll.grid(row=0, column=1, sticky="ns")
+        frame.rowconfigure(0, weight=1)
+        frame.columnconfigure(0, weight=1)
+        box.insert("1.0", text)
+        box.configure(state="disabled")
+        self._detail_window = window
+        self._detail_box = box
+
     def _present_batch_result(self, result: dict[str, Any]) -> None:
         tasks = result.get("tasks") if isinstance(result.get("tasks"), list) else []
         tree = getattr(self, "task_tree", None)
@@ -2568,23 +2845,45 @@ class GeneralDataApp:
                     event["output"] = output.get("path")
                 self._apply_batch_progress(event)
         counts = result.get("counts") if isinstance(result.get("counts"), dict) else {}
+        warnings = [str(item).strip() for item in (result.get("warnings") or []) if str(item).strip()]
+        self._batch_warnings = warnings
         error = result.get("error")
+        notable = [
+            item for item in warnings
+            if any(token in item.lower() for token in ("backup", "corrupt", "恢复", "损坏"))
+        ]
+        def _with_warnings(text: str) -> str:
+            if not warnings:
+                return text
+            shown = notable or warnings[:1]
+            summary = f"{text}。提示 {len(warnings)} 条：" + "；".join(shown)
+            if len(summary) > 240:
+                summary = summary[:239] + "…"
+            return summary
+
         if error and not counts:
             text = error if isinstance(error, str) else str(error)
+            status = _with_warnings(f"批量导出失败：{text}")
+            dialog = f"批量导出失败：{text}"
+            if warnings:
+                dialog += "\n\n提示：\n" + "\n".join(warnings)
             try:
-                self.status_var.set(f"批量导出失败：{text}")
+                self.status_var.set(status)
                 if not os.environ.get("ORI_GUI_BATCH_DRIVE"):
-                    messagebox.showerror("批量导出失败", text, parent=self.root)
+                    messagebox.showerror("批量导出失败", dialog, parent=self.root)
             except tk.TclError:
                 self._busy = False
             return
         text = "批量导出已结束。" + _format_batch_counts(counts)
         if result.get("cancelled") or int(counts.get("cancelled") or 0):
             text += "。已成功的文件保留，尚未开始的任务已取消。"
+        dialog = text + "\n任务列表里有每个文件的状态；PDF 失败会写出具体的图和原因。"
+        if warnings:
+            dialog += "\n\n提示：\n" + "\n".join(warnings)
         try:
-            self.status_var.set(text)
+            self.status_var.set(_with_warnings(text))
             if not os.environ.get("ORI_GUI_BATCH_DRIVE"):
-                messagebox.showinfo("批量导出结束", text + "\n任务列表里有每个文件的状态；PDF 失败会写出具体的图和原因。", parent=self.root)
+                messagebox.showinfo("批量导出结束", dialog, parent=self.root)
         except tk.TclError:
             self._busy = False
 

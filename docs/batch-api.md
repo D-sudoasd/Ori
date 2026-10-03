@@ -2,7 +2,7 @@
 
 批量核心在 `origin_bridge.batch`。通用数据窗口调用 JSON 安全的 `build_batch_request` 和 `origin_bridge.worker.batch_worker`，取消事件单独作为 spawn 参数。不要在 Tk 线程里启动 Origin。
 
-核心审查阶段曾经要求不要改 `origin_bridge/gui.py`。那只约束当时的核心补丁。批量窗口可以修改 GUI。窗口把可恢复的完整请求写到输出目录的 `batch-config.json`（名称、`record_path`、输入路径和请求本体），不改核心成功回执。只有 `batch-record.json` 时不能凭窗口当前默认值重新导出。
+核心审查阶段曾经要求不要改 `origin_bridge/gui.py`。那只约束当时的核心补丁。批量窗口可以修改 GUI。窗口新建批次时把可恢复的完整请求写到 `batch-config-<id>.json`，记录是同目录的 `batch-record-<id>.json`（名称、`record_path`、输入路径和请求本体），不改核心成功回执。旧版 `batch-record.json` 与 `batch-config.json` 仍能配对加载。只有运行记录、没有配套配置时，不能凭窗口当前默认值重新导出。`y_error` 的键必须是 Y 的原始列名；窗口在有误差列而 Y 为列号时会在保存配置前拒绝。
 
 “停止后续”只在任务之间生效：当前这项会跑完，后面的任务取消。它不能打断还没证明归属的 Origin 启动；那种 COM 调用可能一直不返回，此时没有可以安全结束的进程。
 
@@ -314,7 +314,7 @@ proc.join()
 
 ## 记录、续跑和重试
 
-默认记录是 `output_dir/batch-record.json`，日志是把后缀换成 `.log.jsonl`。写入使用临时文件、`fsync` 和 `os.replace`。上一个完整文件保留为 `.bak`。主文件损坏时 `load_batch_record` 使用 `.bak`，并在结果警告里说明已恢复。主文件和备份都损坏时得到空记录和 `_corrupt` 警告，不会把已有输出当成成功。
+未传入 `record_path` 时，默认记录是 `output_dir/batch-record.json`，日志是把后缀换成 `.log.jsonl`。窗口新建批次会传入 `output_dir/batch-record-<id>.json`，配置文件按同一标识命名为 `batch-config-<id>.json`，因此同目录的下一批不会替换上一批的记录、配置、`.bak`、`.previous` 或日志。写入使用临时文件、`fsync` 和 `os.replace`。上一个完整文件保留为 `.bak`。主文件损坏时 `load_batch_record` 使用 `.bak`，并在结果警告里说明已恢复。主文件和备份都损坏时得到空记录和 `_corrupt` 警告，不会把已有输出当成成功。这些警告出现在结果的 `warnings` 里；窗口汇总条数并提供只读详情，而不是为每条警告各弹一次。
 
 非续跑只有在输入发现成功之后，才把已有记录改名为 `batch-record.json.previous` 并从空记录开始。`.previous` 不会在下次启动时被自动恢复。发现失败不会归档、不会删除 `.bak`、也不会写空记录。
 

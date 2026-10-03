@@ -75,7 +75,7 @@ py -3 -m origin_bridge import `
   --plot none
 ```
 
-按文件批量导出使用 `batch`。每个输入文件生成一个 OPJU 或 XLSX；同一 Excel 工作簿的非空工作表进入同一个输出。默认不覆盖已有文件，并用 `batch-record.json` 记录可续跑的任务。通用数据窗口的“每个来源一个文件”调用同一套请求，并另存 `batch-config.json` 以便继续；核心回执本身不含完整全局请求。完整请求、结果、进度、取消、重试和续跑约定见 [batch-api.md](batch-api.md)。启动 Origin 前若 COM 卡住，还没有归属证明，不能结束未知的 Origin 进程。
+按文件批量导出使用 `batch`。每个输入文件生成一个 OPJU 或 XLSX；同一 Excel 工作簿的非空工作表进入同一个输出。默认不覆盖已有文件。命令行未指定记录时用 `batch-record.json`。通用数据窗口的“每个来源一个文件”调用同一套请求，但每次新建批次写入独立的 `batch-record-<id>.json` 和 `batch-config-<id>.json`，避免同目录的下一批覆盖上一批的恢复文件；旧文件名仍可加载。核心回执本身不含完整全局请求。完整请求、结果、进度、取消、重试和续跑约定见 [batch-api.md](batch-api.md)。启动 Origin 前若 COM 卡住，还没有归属证明，不能结束未知的 Origin 进程。
 
 ```powershell
 py -3 -m origin_bridge batch -i .\examples_general -o .\out\batch --format xlsx --plot none

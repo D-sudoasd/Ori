@@ -11,18 +11,44 @@ from __future__ import annotations
 
 import json
 import os
+import uuid
 from pathlib import Path
 from typing import Any, Mapping
 
 CONFIG_KIND = "ori-batch-config"
 CONFIG_SCHEMA_VERSION = 1
 CONFIG_FILENAME = "batch-config.json"
+_RECORD_PREFIX = "batch-record-"
 
 
 def config_path_for(record_path: str | Path) -> Path:
-    """Return the config file that belongs next to a batch record."""
+    """Return the config file that belongs to this record.
+
+    The legacy pair is ``batch-record.json`` and ``batch-config.json``.
+    A fresh window batch uses ``batch-record-<id>.json`` and the config is
+    named from that same id, so a later batch in the folder does not replace
+    the earlier record or config.
+    """
     record = Path(record_path).expanduser().resolve(strict=False)
-    return record.parent / CONFIG_FILENAME
+    name = record.name
+    if name == "batch-record.json":
+        return record.with_name(CONFIG_FILENAME)
+    if name.startswith(_RECORD_PREFIX) and name.endswith(".json"):
+        ident = name[len(_RECORD_PREFIX):-len(".json")]
+        if ident and ident == Path(ident).name:
+            return record.with_name(f"batch-config-{ident}.json")
+    return record.with_name(f"{record.stem}.batch-config.json")
+
+
+def allocate_record_path(output_dir: str | Path) -> Path:
+    """Pick a new record path that does not reuse an existing record or config."""
+    directory = Path(output_dir).expanduser().resolve(strict=False)
+    for _attempt in range(8):
+        candidate = directory / f"{_RECORD_PREFIX}{uuid.uuid4().hex}.json"
+        if candidate.exists() or config_path_for(candidate).exists():
+            continue
+        return candidate
+    raise FileExistsError("无法为新批次分配不冲突的记录名。")
 
 
 def save_batch_config(

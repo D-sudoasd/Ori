@@ -11,6 +11,7 @@ import os
 import subprocess
 import sys
 import tempfile
+import time
 from pathlib import Path
 
 
@@ -21,10 +22,8 @@ def main() -> int:
     if not exe.is_file() or not cli.is_file():
         print(f"missing packaged executable under {root / 'dist'}", file=sys.stderr)
         return 2
-    folder = Path(tempfile.gettempdir()) / "ori-frozen-batch-gui"
-    if folder.exists():
-        import shutil
-        shutil.rmtree(folder)
+    stamp = time.strftime("%Y%m%d-%H%M%S")
+    folder = Path(tempfile.gettempdir()) / f"ori-frozen-batch-gui-review2-{stamp}"
     folder.mkdir(parents=True)
     try:
         _ = folder
@@ -51,6 +50,8 @@ def main() -> int:
             "repair_path": str(repair),
             "report": str(report_path),
             "screenshots": {
+                "visibility_large": str(shots / "visibility-1100x860.bmp"),
+                "visibility_small": str(shots / "visibility-1200x680.bmp"),
                 "started": str(shots / "started.bmp"),
                 "cancelled": str(shots / "cancelled.bmp"),
                 "resumed": str(shots / "resumed.bmp"),
@@ -67,6 +68,27 @@ def main() -> int:
             return 1
         if report.get("inspect_calls_before_export") != 0:
             print("discovery inspected sources", file=sys.stderr)
+            return 1
+        if report.get("launch_via") != "export_button.invoke":
+            print("frozen drive did not use the create button", file=sys.stderr)
+            return 1
+        visibility = report.get("visibility") or []
+        if len(visibility) != 2 or not all(item.get("ok") for item in visibility):
+            print("batch controls were not visible at both sizes", file=sys.stderr)
+            return 1
+        running = report.get("visibility_while_running") or {}
+        if not (running.get("boxes") or {}).get("stop", {}).get("inside"):
+            print("stop was not inside the client while running", file=sys.stderr)
+            return 1
+        hashes = report.get("artifact_hashes") or {}
+        cancelled = hashes.get("after_cancel") or {}
+        resumed = hashes.get("after_resume") or {}
+        retried = hashes.get("after_retry") or {}
+        if not cancelled or any(resumed.get(path) != digest for path, digest in cancelled.items()):
+            print("resume changed successful output hashes", file=sys.stderr)
+            return 1
+        if not retried or any(retried.get(path) != digest for path, digest in cancelled.items()):
+            print("retry changed successful output hashes", file=sys.stderr)
             return 1
         if not report.get("child_pids") or report["parent_pid"] in report["child_pids"]:
             print("batch child pid was not distinct", file=sys.stderr)

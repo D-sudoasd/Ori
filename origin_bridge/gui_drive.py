@@ -9,13 +9,15 @@ batch launch, cancel, and resume methods as the buttons.
 from __future__ import annotations
 
 import ctypes
+import hashlib
 import json
 import os
 import time
+from ctypes import wintypes
 from pathlib import Path
 from typing import Any, Callable
 
-from .batch_config import config_path_for, load_batch_config
+from .batch_config import load_batch_config
 
 
 def run_drive(app: Any, spec_path: str) -> None:
@@ -48,7 +50,6 @@ def run_drive(app: Any, spec_path: str) -> None:
 
 def _run(app: Any, spec: dict[str, Any], report: dict[str, Any]) -> None:
     app.root.deiconify()
-    app.root.geometry("1100x860+40+40")
     app.root.lift()
     try:
         app.root.attributes("-topmost", True)
@@ -58,6 +59,7 @@ def _run(app: Any, spec: dict[str, Any], report: dict[str, Any]) -> None:
     shots = spec.get("screenshots") or {}
     app.layout_var.set("per_file")
     app.format_var.set("xlsx")
+    app._format_changed()
     app.batch_kind_var.set("none")
     app.plot_scope_var.set("自动（按每张表建议）")
     app.batch_name_var.set(str(spec.get("name") or "frozen-batch"))
@@ -71,70 +73,130 @@ def _run(app: Any, spec: dict[str, Any], report: dict[str, Any]) -> None:
     if len(app._paths) != len(spec["inputs"]):
         raise RuntimeError(f"discovered {len(app._paths)} sources, expected {len(spec['inputs'])}")
     _note_windows(app, report)
-    from .batch import build_batch_request
-
+    report["visibility"] = []
+    for geometry, shot_name in (
+        ("1100x860+40+40", "visibility_large"),
+        ("1200x680+20+20", "visibility_small"),
+    ):
+        measured = _measure(app, geometry)
+        report["visibility"].append(measured)
+        if not measured["ok"]:
+            raise RuntimeError(f"batch controls are outside the client at {geometry}: {measured}")
+        if measured["boxes"]["create"]["state"] == "disabled":
+            raise RuntimeError(f"create button is not clickable at {geometry}")
+        _shot(app, shots.get(shot_name), report, shot_name)
     output_dir = Path(spec["output_dir"])
-    request = build_batch_request(
-        app._paths,
-        output_dir,
-        layout="per_file",
-        format="xlsx",
-        read_options={"header": "auto", "skip_rows": 0, "delimiter": "auto", "encoding": "auto", "missing_values": [""], "formula_policy": "cached"},
-        plot={"kind": "none", "x": "auto", "y": "auto", "y_error": "auto", "title": "auto", "x_label": "auto", "y_label": "auto"},
-        overwrite=False,
-        pdf=False,
-        keep_open=False,
-        resume=False,
-    )
-    app._saved_request = request
-    app._launch_batch(request, name=str(spec.get("name") or ""))
+    from origin_bridge import gui as gui_module
+
+    previous_directory = gui_module.filedialog.askdirectory
+    gui_module.filedialog.askdirectory = lambda **_kwargs: str(output_dir)
+    try:
+        report["launch_via"] = "export_button.invoke"
+        app.export_button.invoke()
+    finally:
+        gui_module.filedialog.askdirectory = previous_directory
     _pump(app, lambda: bool(app.task_tree.get_children()) or not app._busy, 180, report)
+    running = _measure(app, "1200x680+20+20")
+    report["visibility_while_running"] = running
+    if not running["boxes"]["stop"]["inside"] or not running["boxes"]["status"]["inside"]:
+        raise RuntimeError(f"stop/status left the client while the batch was running: {running}")
+    if str(app.stop_button.cget("state")) != "normal":
+        raise RuntimeError("stop button was not enabled through the visible control")
     _note_child(app, report)
     _note_windows(app, report)
     _shot(app, shots.get("started"), report, "started")
-    app.stop_later_tasks()
+    app.stop_button.invoke()
     gaps.extend(_pump(app, lambda: not app._busy, 180, report))
     _shot(app, shots.get("cancelled"), report, "cancelled")
     report["phases"].append({"name": "cancel", "status": app.status_var.get()})
-    _resume(app, request["record_path"], retry=False)
+    config = _config_in(output_dir)
+    record_path = str(config["record_path"])
+    report["record_path"] = record_path
+    report["artifact_hashes"] = {"after_cancel": _succeeded_hashes(record_path)}
+    _press_resume(app, record_path, retry=False)
     gaps.extend(_pump(app, lambda: not app._busy, 180, report))
     _note_child(app, report)
     _shot(app, shots.get("resumed"), report, "resumed")
     report["phases"].append({"name": "resume", "status": app.status_var.get()})
-    record = _load_record(request["record_path"])
+    report["artifact_hashes"]["after_resume"] = _succeeded_hashes(record_path)
+    _require_same_hashes(report["artifact_hashes"]["after_cancel"], report["artifact_hashes"]["after_resume"])
+    record = _load_record(record_path)
     failed = [
         task for task in dict(record.get("tasks") or {}).values()
         if isinstance(task, dict) and task.get("status") in {"failed", "cancelled", "blocked"}
     ]
     if failed and spec.get("repair_path"):
         Path(spec["repair_path"]).write_text("x,y\n1,2\n3,4\n", encoding="utf-8")
-        _resume(app, request["record_path"], retry=True)
+        _press_resume(app, record_path, retry=True)
         gaps.extend(_pump(app, lambda: not app._busy, 180, report))
         _note_child(app, report)
         _shot(app, shots.get("retried"), report, "retried")
         report["phases"].append({"name": "retry", "status": app.status_var.get()})
+        report["artifact_hashes"]["after_retry"] = _succeeded_hashes(record_path)
+        _require_same_hashes(report["artifact_hashes"]["after_cancel"], report["artifact_hashes"]["after_retry"])
     report["heartbeat_max_gap_s"] = max(gaps) if gaps else None
     report["final_status"] = app.status_var.get()
     _note_windows(app, report)
 
 
-def _resume(app: Any, record_path: str, *, retry: bool) -> None:
-    config = load_batch_config(config_path_for(record_path))
-    request = json.loads(json.dumps(config["request"]))
-    request["resume"] = True
-    request["overwrite"] = bool(config["request"].get("overwrite", False))
-    if retry:
-        from .batch import load_batch_record
+def _press_resume(app: Any, record_path: str, *, retry: bool) -> None:
+    from origin_bridge import gui as gui_module
 
-        record = load_batch_record(record_path)
-        request["retry_task_ids"] = [
-            task_id
-            for task_id, task in dict(record.get("tasks") or {}).items()
-            if isinstance(task, dict) and task.get("status") in {"failed", "cancelled", "blocked"}
-        ]
-    else:
-        request["retry_task_ids"] = []
-    app._arm_restored_batch(config, request)
+    previous = gui_module.filedialog.askopenfilename
+    gui_module.filedialog.askopenfilename = lambda **_kwargs: record_path
+    try:
+        button = app.retry_button if retry else app.continue_button
+        button.invoke()
+    finally:
+        gui_module.filedialog.askopenfilename = previous
+
+
+def _config_in(output_dir: Path) -> dict[str, Any]:
+    matches = sorted(path for path in output_dir.glob("batch-config-*.json") if path.is_file())
+    if len(matches) != 1:
+        raise RuntimeError(f"expected one fresh batch config in {output_dir}, found {matches}")
+    return load_batch_config(matches[0])
+
+
+def _succeeded_hashes(record_path: str) -> dict[str, str]:
+    from .batch import load_batch_record
+
+    record = load_batch_record(record_path)
+    hashes: dict[str, str] = {}
+    for task in dict(record.get("tasks") or {}).values():
+        if not isinstance(task, dict) or task.get("status") != "succeeded":
+            continue
+        output = task.get("output") or {}
+        path = output.get("path") if isinstance(output, dict) else None
+        if not path or not Path(path).is_file():
+            continue
+        digest = hashlib.sha256(Path(path).read_bytes()).hexdigest()
+        hashes[str(path)] = digest
+    if not hashes:
+        raise RuntimeError("cancel/resume left no successful output to hash")
+    return hashes
+
+
+def _require_same_hashes(before: dict[str, str], after: dict[str, str]) -> None:
+    missing = [path for path in before if after.get(path) != before[path]]
+    if missing:
+        raise RuntimeError(f"successful outputs changed: {missing}")
+
+
+def _measure(app: Any, geometry: str) -> dict[str, Any]:
+    from .gui import widget_in_client
+
+    app.root.geometry(geometry)
+    app.root.update_idletasks()
+    app.root.update()
+    boxes = {
+        "create": widget_in_client(app.root, app.export_button),
+        "stop": widget_in_client(app.root, app.stop_button),
+        "status": widget_in_client(app.root, app.status_label),
+        "tasks": widget_in_client(app.root, app.task_tree),
+    }
+    ok = all(bool(item["inside"]) for item in boxes.values()) and int(boxes["tasks"]["height"]) >= 40
+    return {"geometry": geometry, "ok": ok, "boxes": boxes}
 
 
 def _load_record(record_path: str) -> dict[str, Any]:
@@ -198,7 +260,7 @@ def capture_tk(widget: Any, path: Path) -> None:
     hwnd = int(widget.winfo_id())
     root = user32.GetAncestor(hwnd, 2) or hwnd
     user32.SetForegroundWindow(root)
-    rect = ctypes.wintypes.RECT()
+    rect = wintypes.RECT()
     user32.GetWindowRect(root, ctypes.byref(rect))
     width = max(1, int(rect.right - rect.left))
     height = max(1, int(rect.bottom - rect.top))
