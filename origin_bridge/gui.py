@@ -82,9 +82,86 @@ def _read_options(header: str, skip_rows: str | int, delimiter: str) -> dict[str
     }
 
 
-def _iter_supported_files(root: Path) -> list[Path]:
-    """List supported files under a folder, yielding the GIL between directory reads."""
+def _job_error_text(exc: BaseException) -> str:
+    detail = str(exc).strip() or exc.__class__.__name__
+    return f"读取来源失败：{detail}"
+
+
+_REPARSE_POINT = 0x400
+
+
+def _path_is_link(path: Path) -> bool:
+    try:
+        if path.is_symlink():
+            return True
+    except OSError:
+        return True
+    probe = getattr(path, "is_junction", None)
+    if callable(probe):
+        try:
+            return bool(probe())
+        except OSError:
+            return False
+    try:
+        attributes = getattr(os.lstat(path), "st_file_attributes", 0)
+    except OSError:
+        return False
+    return bool(attributes & _REPARSE_POINT)
+
+
+def _entry_is_symlink(entry: os.DirEntry[str]) -> bool:
+    try:
+        return bool(entry.is_symlink())
+    except OSError:
+        return False
+
+
+def _entry_is_directory_link(entry: os.DirEntry[str]) -> bool:
+    """True for a junction or a directory symlink.
+
+    On Python 3.13 / Windows a junction is not a symlink:
+    ``is_dir(follow_symlinks=False)`` is true and ``is_junction`` is true.
+    A directory symlink is the opposite: ``is_symlink`` is true and
+    ``is_dir(follow_symlinks=False)`` is false, so it must be classified
+    before the non-following file/dir checks. Python 3.10 has no
+    ``is_junction``; a junction there is a reparse point and still a
+    directory when links are not followed.
+    """
+    probe = getattr(entry, "is_junction", None)
+    if callable(probe):
+        try:
+            if probe():
+                return True
+        except OSError:
+            return False
+    elif not _entry_is_symlink(entry):
+        try:
+            attributes = getattr(entry.stat(follow_symlinks=False), "st_file_attributes", 0)
+        except OSError:
+            attributes = 0
+        if attributes & _REPARSE_POINT:
+            return True
+    if not _entry_is_symlink(entry):
+        return False
+    try:
+        return bool(entry.is_dir(follow_symlinks=True))
+    except OSError:
+        return False
+
+
+def _iter_supported_files(root: Path) -> tuple[list[Path], list[str]]:
+    """List supported files under a folder, yielding the GIL between directory reads.
+
+    File symlinks are included when their own suffix is supported. Directory
+    symlinks and junctions are followed. ``seen_dirs`` stores each resolved
+    target, so a link back to an ancestor is skipped instead of looping.
+    A link that cannot be resolved or listed is returned in the rejection
+    list. ``discover_files`` uses ``Path.rglob``, which also descends into
+    junctions, but it does not keep this set: a junction cycle does not
+    finish there.
+    """
     found: list[Path] = []
+    rejected: list[str] = []
     stack = [root]
     seen_dirs: set[str] = set()
     visited = 0
@@ -92,32 +169,52 @@ def _iter_supported_files(root: Path) -> list[Path]:
         current = stack.pop()
         try:
             dir_key = _normalized_path(current)
-        except OSError:
+        except OSError as exc:
+            if _path_is_link(Path(current)):
+                rejected.append(f"{current}（无法解析目录链接：{exc}）")
             continue
         if dir_key in seen_dirs:
             continue
         seen_dirs.add(dir_key)
         try:
             children = list(os.scandir(current))
-        except OSError:
+        except OSError as exc:
+            if _path_is_link(Path(current)):
+                rejected.append(f"{current}（无法跟随目录链接：{exc}）")
             continue
         visited += 1
         if visited % 20 == 0:
             time.sleep(0)
         for entry in children:
+            path = Path(entry.path)
             try:
+                if _entry_is_directory_link(entry):
+                    stack.append(path)
+                    continue
+                if _entry_is_symlink(entry):
+                    try:
+                        is_file = entry.is_file(follow_symlinks=True)
+                    except OSError as exc:
+                        rejected.append(f"{path}（无法跟随符号链接：{exc}）")
+                        continue
+                    if not is_file:
+                        rejected.append(f"{path}（符号链接目标不存在或不是可导入文件）")
+                        continue
+                    if path.suffix.casefold() in SUPPORTED_SUFFIXES:
+                        found.append(path.resolve())
+                    continue
                 if entry.is_dir(follow_symlinks=False):
-                    stack.append(Path(entry.path))
-                elif entry.is_file(follow_symlinks=False) and Path(entry.path).suffix.casefold() in SUPPORTED_SUFFIXES:
-                    found.append(Path(entry.path).resolve())
-            except OSError:
-                continue
-    if not found:
+                    stack.append(path)
+                elif entry.is_file(follow_symlinks=False) and path.suffix.casefold() in SUPPORTED_SUFFIXES:
+                    found.append(path.resolve())
+            except OSError as exc:
+                rejected.append(f"{path}（{exc}）")
+    if not found and not rejected:
         raise ValueError(f"目录中没有可导入的数据文件：{root}")
     unique: dict[Path, None] = {}
     for path in found:
         unique[path] = None
-    return sorted(unique, key=_natural_key)
+    return sorted(unique, key=_natural_key), rejected
 
 
 def _collect_supported(paths: list[str | Path]) -> tuple[list[Path], list[str]]:
@@ -134,7 +231,8 @@ def _collect_supported(paths: list[str | Path]) -> tuple[list[Path], list[str]]:
             continue
         try:
             if path.is_dir():
-                candidates = _iter_supported_files(path.resolve())
+                candidates, notes = _iter_supported_files(path.resolve())
+                rejected.extend(notes)
             else:
                 candidates = discover_files([path.resolve()])
         except ValueError as exc:
@@ -226,6 +324,9 @@ class GeneralDataApp:
         self._done_message: dict[str, Any] | None = None
         self._poll_confirms = 0
         self._iid_seq = 0
+        self._closed = False
+        self._poll_after = None
+        self._hook_after = None
         self._busy = False
         self._interactive: list[tk.Widget] = []
         self._widget_states: dict[tk.Widget, str] = {}
@@ -245,7 +346,8 @@ class GeneralDataApp:
 
         self._build()
         self.root.protocol("WM_DELETE_WINDOW", self._on_close)
-        self.root.after(200, self._hook_drop)
+        self._guard_destroy()
+        self._hook_after = self.root.after(200, self._hook_drop)
         if initial_files:
             self._add_paths(initial_files, announce=False)
 
@@ -383,6 +485,9 @@ class GeneralDataApp:
         ttk.Label(outer, textvariable=self.status_var, wraplength=980, justify=tk.LEFT).pack(fill=tk.X, pady=(8, 0))
 
     def _hook_drop(self) -> None:
+        self._hook_after = None
+        if not self._ui_alive():
+            return
         try:
             import spectra_to_origin as sto
 
@@ -421,37 +526,36 @@ class GeneralDataApp:
         def scan_task() -> None:
             try:
                 found, rejected = _collect_supported(requested)
+                existing_keys = set()
+                for index, path in enumerate(existing):
+                    existing_keys.add(_source_key({"path": path})[0])
+                    if index % 25 == 0:
+                        time.sleep(0)
+                added = []
+                added_records = []
+                for index, path in enumerate(found):
+                    key = _source_key({"path": path})[0]
+                    if key not in existing_keys:
+                        added.append(path)
+                        added_records.append((path, key))
+                    if index % 25 == 0:
+                        time.sleep(0)
+                self._thread_queue.put({
+                    "kind": "scan",
+                    "added": added_records,
+                    "rejected": rejected,
+                    "announce": announce,
+                })
+                self._inspect_paths_worker(added, options, "replace")
+                self._thread_queue.put({
+                    "kind": "inspect_done",
+                    "mode": "add",
+                    "added_count": len(added),
+                    "announce": announce,
+                    "rejected_count": len(rejected),
+                })
             except Exception as exc:
-                self._thread_queue.put({"kind": "job_error", "error": str(exc)})
-                return
-            existing_keys = set()
-            for index, path in enumerate(existing):
-                existing_keys.add(_source_key({"path": path})[0])
-                if index % 25 == 0:
-                    time.sleep(0)
-            added = []
-            added_records = []
-            for index, path in enumerate(found):
-                key = _source_key({"path": path})[0]
-                if key not in existing_keys:
-                    added.append(path)
-                    added_records.append((path, key))
-                if index % 25 == 0:
-                    time.sleep(0)
-            self._thread_queue.put({
-                "kind": "scan",
-                "added": added_records,
-                "rejected": rejected,
-                "announce": announce,
-            })
-            self._inspect_paths_worker(added, options, "replace")
-            self._thread_queue.put({
-                "kind": "inspect_done",
-                "mode": "add",
-                "added_count": len(added),
-                "announce": announce,
-                "rejected_count": len(rejected),
-            })
+                self._thread_queue.put({"kind": "job_error", "error": _job_error_text(exc)})
 
         self._start_thread(scan_task, "scan")
 
@@ -496,6 +600,13 @@ class GeneralDataApp:
             self.status_var.set("已移除数据源。")
 
     def reload_inputs(self) -> None:
+        """Re-read every current file with the visible header, skip, and delimiter.
+
+        This drops a loaded plan. Worksheet filtering from that plan is not
+        kept: the visible controls have no sheet, so each workbook is listed
+        as one row per worksheet. Plots tied to the plan's sheet options are
+        dropped when that read identity no longer matches.
+        """
         if not self._paths or self._busy:
             return
         self._save_current_plot()
@@ -512,7 +623,7 @@ class GeneralDataApp:
                 self._inspect_paths_worker(paths, options, "replace")
                 self._thread_queue.put({"kind": "inspect_done", "mode": "reload", "added_count": len(paths), "announce": False})
             except Exception as exc:
-                self._thread_queue.put({"kind": "job_error", "error": str(exc)})
+                self._thread_queue.put({"kind": "job_error", "error": _job_error_text(exc)})
 
         self._start_thread(reload_task, "inspect")
 
@@ -526,10 +637,6 @@ class GeneralDataApp:
             messagebox.showerror("读取选项无效", "跳过行数必须大于或等于 0。", parent=self.root)
             return None
         return options
-
-    def _inspect_paths(self) -> None:
-        """Re-check every current source. Retained for callers that reload in place."""
-        self.reload_inputs()
 
     def _inspect_paths_worker(self, paths: list[Path], options: dict[str, Any], update: str) -> None:
         for path in paths:
@@ -546,11 +653,20 @@ class GeneralDataApp:
 
         def inspect_task() -> None:
             try:
+                # One inspect per path and compatible read options. Sheet is
+                # selected afterwards so a multi-sheet workbook is not read
+                # once per saved row. The path cache stays a single slot.
+                shared: dict[tuple[str, str], dict[str, Any]] = {}
                 for plan_table in plan_tables:
                     source = plan_table["source"]
                     options = dict(source.get("options") or {})
                     source_path = _resolve_plan_path(source["path"], base_dir)
-                    outcome = self._summaries.inspect_path(source_path, options)
+                    broad = dict(options)
+                    broad["sheet"] = None
+                    group_key = (_normalized_path(source_path), options_fingerprint(broad))
+                    if group_key not in shared:
+                        shared[group_key] = self._summaries.inspect_path(source_path, broad)
+                    outcome = self._plan_sheet_outcome(shared[group_key], source_path, options)
                     self._thread_queue.put({"kind": "source", "outcome": outcome, "update": "append"})
                 self._thread_queue.put({
                     "kind": "inspect_done",
@@ -559,9 +675,107 @@ class GeneralDataApp:
                     "announce": False,
                 })
             except Exception as exc:
-                self._thread_queue.put({"kind": "job_error", "error": str(exc)})
+                self._thread_queue.put({"kind": "job_error", "error": _job_error_text(exc)})
 
         self._start_thread(inspect_task, "load_plan")
+
+    @staticmethod
+    def _summary_sheet(table: dict[str, Any]) -> str | None:
+        source = table.get("source") or {}
+        options = source.get("options") or {}
+        sheet = options.get("sheet", source.get("sheet"))
+        return str(sheet) if sheet is not None else None
+
+    def _plan_sheet_outcome(self, broad: dict[str, Any], source_path: Path, options: dict[str, Any]) -> dict[str, Any]:
+        """Keep one plan row's sheet from a workbook read that asked for every sheet."""
+        fingerprint = options_fingerprint(options)
+        sheet = options.get("sheet")
+        wanted = str(sheet) if sheet is not None else None
+        path = str(broad.get("path") or source_path)
+        if not broad.get("ok"):
+            failed = dict(broad)
+            failed["path"] = path
+            failed["requested_fingerprint"] = fingerprint
+            return failed
+        tables = list(broad.get("tables") or [])
+        if wanted is not None:
+            tables = [table for table in tables if self._summary_sheet(table) == wanted]
+        if not tables:
+            return {
+                "ok": False,
+                "path": path,
+                "tables": [],
+                "error": f"没有工作表：{wanted}",
+                "reused": False,
+                "sha256": broad.get("sha256") or "",
+                "requested_fingerprint": fingerprint,
+            }
+        return {
+            "ok": True,
+            "path": path,
+            "tables": tables,
+            "error": "",
+            "reused": bool(broad.get("reused")),
+            "sha256": broad.get("sha256") or "",
+            "requested_fingerprint": fingerprint,
+        }
+
+    def _ui_alive(self) -> bool:
+        root = getattr(self, "root", None)
+        exists = getattr(root, "winfo_exists", None)
+        if not callable(exists):
+            return True
+        try:
+            return bool(exists())
+        except tk.TclError:
+            return False
+
+    def _after(self, delay_ms: int, callback) -> None:
+        if getattr(self, "_closed", False) or not self._ui_alive():
+            return
+        try:
+            after_id = self.root.after(delay_ms, callback)
+        except tk.TclError:
+            return
+        if hasattr(self, "_poll_after"):
+            self._poll_after = after_id
+
+    def _cancel_scheduled_ui(self) -> None:
+        for after_id in (self._poll_after, self._hook_after):
+            if not after_id:
+                continue
+            try:
+                self.root.after_cancel(after_id)
+            except tk.TclError:
+                pass
+        self._poll_after = None
+        self._hook_after = None
+
+    def _guard_destroy(self) -> None:
+        """Cancel timers before Tcl tears the window down.
+
+        ``root.destroy()`` is the existing close path and the direct call a
+        scan can receive. A ``<Destroy>`` binding also runs for child widgets
+        and is the wrong place to touch timers.
+        """
+        root = self.root
+        original = root.destroy
+
+        def destroy(*args, **kwargs):
+            if not self._closed:
+                self._closed = True
+                self._cancel_scheduled_ui()
+                self._abandon_source_job()
+            return original(*args, **kwargs)
+
+        root.destroy = destroy
+
+    def _abandon_source_job(self) -> None:
+        """Drop source-job state after the window is already gone."""
+        self._thread = None
+        self._thread_kind = None
+        self._busy = False
+        self._pending_outcomes.clear()
 
     def _start_thread(self, target, kind: str) -> None:
         if self._busy:
@@ -575,9 +789,12 @@ class GeneralDataApp:
         self._thread_kind = kind
         self._thread = threading.Thread(target=target, name=f"origin-bridge-{kind}", daemon=True)
         self._thread.start()
-        self.root.after(16, self._poll_thread)
+        self._after(16, self._poll_thread)
 
     def _poll_thread(self) -> None:
+        if not self._ui_alive():
+            self._abandon_source_job()
+            return
         started = time.monotonic()
         handled = 0
         while handled < _UI_MESSAGE_BUDGET and (time.monotonic() - started) < _UI_FRAME_SECONDS:
@@ -590,22 +807,26 @@ class GeneralDataApp:
         flushed = self._flush_outcomes(started)
         if flushed and self._paths:
             seen = len(self._tables) + len(self._source_errors)
-            self.status_var.set(f"正在检查来源 {seen}/{len(self._paths)}…")
+            try:
+                self.status_var.set(f"正在检查来源 {seen}/{len(self._paths)}…")
+            except tk.TclError:
+                self._abandon_source_job()
+                return
         thread = self._thread
         alive = thread is not None and thread.is_alive()
         more = bool(self._pending_outcomes) or not self._thread_queue.empty()
         if alive or more:
             self._poll_confirms = 0
-            self.root.after(16, self._poll_thread)
+            self._after(16, self._poll_thread)
             return
         if thread is not None:
             thread.join(timeout=0.2)
             if thread.is_alive() or not self._thread_queue.empty() or self._pending_outcomes:
-                self.root.after(16, self._poll_thread)
+                self._after(16, self._poll_thread)
                 return
         if not self._job_terminal and self._poll_confirms < 1:
             self._poll_confirms += 1
-            self.root.after(16, self._poll_thread)
+            self._after(16, self._poll_thread)
             return
         if not self._job_terminal:
             self._job_error = self._job_error or "后台读取意外结束。"
@@ -731,17 +952,27 @@ class GeneralDataApp:
         self._replace_path_rows(path_key, fresh_tables)
 
     def _finish_source_job(self) -> None:
+        if not self._ui_alive():
+            self._abandon_source_job()
+            return
         done = self._done_message or {}
         error = self._job_error
         self._thread = None
         self._thread_kind = None
         self._job_error = None
         self._done_message = None
-        self._set_busy(False)
-        self._ensure_selection()
+        try:
+            self._set_busy(False)
+            self._ensure_selection()
+        except tk.TclError:
+            self._busy = False
+            return
         if error:
-            self.status_var.set("读取失败。")
-            messagebox.showerror("数据读取失败", error, parent=self.root)
+            try:
+                self.status_var.set("读取失败。")
+                messagebox.showerror("数据读取失败", error, parent=self.root)
+            except tk.TclError:
+                self._busy = False
             return
         if done.get("mode") == "add" and not done.get("added_count") and not self._source_errors:
             return
@@ -756,7 +987,10 @@ class GeneralDataApp:
             warnings = [str(warning) for table in self._tables for warning in (table.get("warnings") or [])]
             if warnings:
                 text += " " + "；".join(warnings[:3])
-        self.status_var.set(text)
+        try:
+            self.status_var.set(text)
+        except tk.TclError:
+            self._busy = False
 
     def _same_cached_rows(self, path_key: str, tables: list[dict[str, Any]], requested: str) -> bool:
         iids = self._iids_by_path.get(path_key) or []
@@ -916,31 +1150,6 @@ class GeneralDataApp:
         self.table_tree.focus(chosen)
         self._select_table(self._tables_by_iid[chosen])
 
-    def _populate_tables(self, tables: list[dict[str, Any]]) -> None:
-        """Rebuild source rows in frame-sized slices. ``tables`` are summaries, not raw data."""
-        rows = [table for table in tables if isinstance(table, dict)]
-        self._tables = [table for table in rows if not table.get("error")]
-        self._table_keys = [self._cached_path_key((table.get("source") or {}).get("path", "")) for table in self._tables]
-        self._tables_by_iid.clear()
-        self._iids_by_path.clear()
-        children = self.table_tree.get_children()
-        if children:
-            self.table_tree.delete(*children)
-        pending: deque[dict[str, Any]] = deque(rows)
-
-        def flush_rebuild() -> None:
-            started = time.monotonic()
-            flushed = 0
-            while pending and flushed < _UI_ROW_BUDGET and (time.monotonic() - started) < _UI_FRAME_SECONDS:
-                self._append_row(pending.popleft())
-                flushed += 1
-            if pending:
-                self.root.after(16, flush_rebuild)
-                return
-            self._ensure_selection()
-
-        flush_rebuild()
-
     @staticmethod
     def _default_plot(table: dict[str, Any]) -> dict[str, Any]:
         columns = table.get("columns", [])
@@ -961,27 +1170,6 @@ class GeneralDataApp:
             "y_label": "",
         }
 
-    def _populate_tables(self, tables: list[dict[str, Any]]) -> None:
-        self.table_tree.delete(*self.table_tree.get_children())
-        self._tables_by_iid.clear()
-        for index, table in enumerate(tables):
-            source = table.get("source", {})
-            iid = str(index)
-            self._tables_by_iid[iid] = table
-            self.table_tree.insert(
-                "",
-                tk.END,
-                iid=iid,
-                values=(source.get("path", ""), source.get("sheet") or "", table.get("n_rows", ""), len(table.get("columns", []))),
-            )
-        if tables:
-            first = str(0)
-            self.table_tree.selection_set(first)
-            self.table_tree.focus(first)
-            self._select_table(self._tables_by_iid[first])
-        else:
-            self._show_table(None)
-
     def _on_table_selection(self, _event=None) -> None:
         if self._busy:
             return
@@ -994,23 +1182,33 @@ class GeneralDataApp:
         self._current_table = table
         self._show_table(table)
 
+    def _clear_source_controls(self) -> None:
+        """Drop the previous table's axes so an error or empty selection cannot keep them."""
+        self.sample_tree.configure(columns=())
+        self.sample_tree["show"] = "headings"
+        self.y_list.delete(0, tk.END)
+        self.x_combo.configure(values=("行号",))
+        self.error_combo.configure(values=("无",))
+        self.plot_kind_var.set("none")
+        self.x_choice_var.set("行号")
+        self.error_choice_var.set("无")
+        self.title_var.set("")
+        self.x_label_var.set("")
+        self.y_label_var.set("")
+        try:
+            self.error_combo.configure(state="disabled")
+        except tk.TclError:
+            pass
+
     def _show_table(self, table: dict[str, Any] | None) -> None:
         self.column_tree.delete(*self.column_tree.get_children())
         self.sample_tree.delete(*self.sample_tree.get_children())
         if table is not None and table.get("error"):
-            self.sample_tree.configure(columns=())
-            self.sample_tree["show"] = "headings"
-            self.y_list.delete(0, tk.END)
-            self.x_combo.configure(values=("行号",))
-            self.error_combo.configure(values=("无",))
+            self._clear_source_controls()
             self.status_var.set(f"来源读取失败：{table['error']}")
             return
         if table is None:
-            self.sample_tree.configure(columns=())
-            self.sample_tree["show"] = "headings"
-            self.y_list.delete(0, tk.END)
-            self.x_combo.configure(values=("行号",))
-            self.error_combo.configure(values=("无",))
+            self._clear_source_controls()
             return
 
         columns = table.get("columns", [])
@@ -1293,9 +1491,13 @@ class GeneralDataApp:
         self._import_exit_waits = 0
         self._import_eof = False
         self._set_busy(True)
-        self.root.after(100, self._poll_import)
+        self._after(100, self._poll_import)
 
     def _poll_import(self) -> None:
+        if not self._ui_alive():
+            self._release_import_handles()
+            self._busy = False
+            return
         process = self._import_process
         recv_conn = self._import_recv
         if process is None or recv_conn is None:
@@ -1320,27 +1522,53 @@ class GeneralDataApp:
             elif message.get("type") == "progress":
                 text = message.get("text")
                 if text:
-                    self.status_var.set(str(text))
+                    try:
+                        self.status_var.set(str(text))
+                    except tk.TclError:
+                        self._release_import_handles()
+                        self._busy = False
+                        return
         try:
             alive = process.is_alive()
         except ValueError:
             alive = False
         if alive:
             self._import_exit_waits = 0
-            self.root.after(120, self._poll_import)
+            self._after(120, self._poll_import)
             return
         if not self._import_eof:
             try:
                 if recv_conn.poll():
-                    self.root.after(1, self._poll_import)
+                    self._after(1, self._poll_import)
                     return
             except (EOFError, OSError):
                 self._import_eof = True
         if self._import_result is None and not self._import_eof and self._import_exit_waits < _IMPORT_EXIT_POLLS:
             self._import_exit_waits += 1
-            self.root.after(30, self._poll_import)
+            self._after(30, self._poll_import)
             return
         self._complete_import()
+
+    def _release_import_handles(self) -> None:
+        process = self._import_process
+        recv_conn = self._import_recv
+        self._import_process = None
+        self._import_recv = None
+        if process is not None:
+            try:
+                if process.is_alive():
+                    process.join(timeout=1)
+            except (ValueError, OSError):
+                pass
+            try:
+                process.close()
+            except (ValueError, OSError):
+                pass
+        if recv_conn is not None:
+            try:
+                recv_conn.close()
+            except OSError:
+                pass
 
     def _complete_import(self) -> None:
         process = self._import_process
@@ -1364,7 +1592,12 @@ class GeneralDataApp:
                 recv_conn.close()
             except OSError:
                 pass
-        self._set_busy(False)
+        try:
+            self._set_busy(False)
+        except tk.TclError:
+            self._busy = False
+        if not self._ui_alive():
+            return
         result = self._import_result if isinstance(self._import_result, dict) else {
             "ok": False,
             "error": f"后台进程未返回结果（退出码 {exit_code}）。",
@@ -1374,17 +1607,23 @@ class GeneralDataApp:
             warnings = result.get("warnings", [])
             path = output.get("path", "") if isinstance(output, dict) else str(output)
             size = output.get("size_bytes") if isinstance(output, dict) else None
-            self.status_var.set(f"已创建：{path}" + (f"（{size:,} 字节）" if isinstance(size, int) else ""))
-            details = f"文件已创建：\n{path}"
-            if isinstance(size, int):
-                details += f"\n大小：{size:,} 字节"
-            if warnings:
-                details += "\n\n提示：\n" + "\n".join(map(str, warnings))
-            messagebox.showinfo("导入完成", details, parent=self.root)
+            try:
+                self.status_var.set(f"已创建：{path}" + (f"（{size:,} 字节）" if isinstance(size, int) else ""))
+                details = f"文件已创建：\n{path}"
+                if isinstance(size, int):
+                    details += f"\n大小：{size:,} 字节"
+                if warnings:
+                    details += "\n\n提示：\n" + "\n".join(map(str, warnings))
+                messagebox.showinfo("导入完成", details, parent=self.root)
+            except tk.TclError:
+                self._busy = False
         else:
             error = result.get("error", "导出失败")
-            self.status_var.set(f"导出失败：{error}")
-            messagebox.showerror("导入失败", str(error), parent=self.root)
+            try:
+                self.status_var.set(f"导出失败：{error}")
+                messagebox.showerror("导入失败", str(error), parent=self.root)
+            except tk.TclError:
+                self._busy = False
 
     def save_plan(self) -> None:
         if self._busy:
