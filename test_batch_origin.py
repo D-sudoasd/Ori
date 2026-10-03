@@ -367,6 +367,73 @@ class RealOriginBatchTests(unittest.TestCase):
         self.assertEqual(result["origin"]["starts"], 1)
         self._wait_until_origin_quiescent()
 
+    def test_two_graph_snapshot_recovery_keeps_hashes(self):
+        import hashlib
+
+        from origin_bridge.batch import build_batch_request, execute_batch
+        from origin_bridge.session import origin_pids, validate_pdf_file
+
+        self.baseline = set(origin_pids())
+        folder = self.root / "snapshot"
+        folder.mkdir()
+        source = folder / "two.xlsx"
+        _write_multi_workbook(source)
+        output = self.root / "snapshot-out"
+        plot = {"kind": "line", "x": "x", "y": ["y"]}
+        started = time.perf_counter()
+        first = execute_batch(build_batch_request([source], output, format="opju", pdf=True, plot=plot))
+        self.owned.update(first["origin"]["owned_pids"])
+        self.assertTrue(first["ok"], first)
+        task = first["tasks"][0]
+        self.assertEqual(task["pdf_status"], "ok", task)
+        self.assertEqual(len(task["pdfs"]), 2, task)
+        opju = Path(task["output"]["path"])
+        pdfs = sorted(task["pdfs"], key=lambda item: int(item["index"]))
+        kept = Path(pdfs[0]["path"])
+        missing = Path(pdfs[1]["path"])
+
+        def digest(path: Path) -> str:
+            return hashlib.sha256(path.read_bytes()).hexdigest()
+
+        before = {"opju": digest(opju), "kept": digest(kept), "filled": digest(missing)}
+        missing.unlink()
+        self._wait_until_origin_quiescent()
+        resumed = execute_batch(build_batch_request(
+            [source], output, format="opju", pdf=True, plot=plot, resume=True,
+        ))
+        self.owned.update(resumed["origin"]["owned_pids"])
+        resumed_task = resumed["tasks"][0]
+        self.assertEqual(resumed_task["pdf_status"], "ok", resumed)
+        self.assertEqual(sorted(item["index"] for item in resumed_task["pdfs"]), [1, 2])
+        after = {
+            "opju": digest(opju),
+            "kept": digest(kept),
+            "filled": digest(missing),
+        }
+        self.assertEqual(after["opju"], before["opju"])
+        self.assertEqual(after["kept"], before["kept"])
+        self.assertGreaterEqual(validate_pdf_file(missing)["pages"], 1)
+        self.assertGreaterEqual(validate_pdf_file(kept)["pages"], 1)
+        report = {
+            "kind": "snapshot-recovery",
+            "files": 1,
+            "graphs": 2,
+            "python": sys.version,
+            "executable": sys.executable,
+            "elapsed_s": time.perf_counter() - started,
+            "origin_first": first["origin"],
+            "origin_resume": resumed["origin"],
+            "before": before,
+            "after": after,
+            "opju_unchanged": after["opju"] == before["opju"],
+            "kept_pdf_unchanged": after["kept"] == before["kept"],
+            "filled_pdf_pages": validate_pdf_file(missing)["pages"],
+        }
+        report_path = Path(tempfile.gettempdir()) / "ori_batch_r3_snapshot_report.json"
+        report_path.write_text(json.dumps(report, ensure_ascii=False, indent=2), encoding="utf-8")
+        print("BATCH_ORIGIN_SNAPSHOT " + json.dumps(report, ensure_ascii=False))
+        self._wait_until_origin_quiescent()
+
     def _wait_until_origin_quiescent(self) -> None:
         from origin_bridge.session import origin_pids, terminate_pid
 

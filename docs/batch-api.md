@@ -165,7 +165,13 @@ PDF 为 `<opju stem>__g01_<表名最多 40 字符>.pdf`，序号按图形顺序�
 
 已有 Origin 进程会拒绝附着，不会被修改，也不会被结束。本程序只在 COM 启动之后用该实例打开一个私有哨兵文件，再用 Windows Restart Manager 查询持有者。路径经 `set_lt_str("file.filename$", path)` 写入，再执行 `file.mode=2; file.open();`。不要把带反斜杠的路径直接放进 `file.open(路径)`：LabTalk 会把它当成转义，打开结果不能当作持有证明。只有恰好一个持有者，且其可执行映像是 `Origin64.exe` 或 `Origin.exe` 时才认领。认领同时保存进程句柄和创建时间。Restart Manager 的应用显示名不是映像路径，不能当作证明。零个持有者、多个持有者、映像不是 Origin，或句柄创建时间对不上，都算没有证明：调用该 COM 对象的 `exit()` 后失败，错误写明没有结束候选进程。不会因为“启动后新出现的 Origin”或“当时只有一个 Origin”去结束进程。
 
-超时、关闭等待和 `terminate_owned` 使用同一套身份：句柄仍对应原创建时间，并且该 PID 当前的创建时间也相同。PID 被复用时视为不健康，不结束那个新进程。句柄在关闭时释放，重复关闭不再释放一次。`set_show` 发生在归属证明之前，此阶段看门狗尚未武装；若这一步挂起且归属仍无法证明，不能安全结束任何进程。这是已知边界。
+超时、关闭等待和 `terminate_owned` 使用同一套身份：句柄仍对应原创建时间，并且该 PID 当前的创建时间也相同。PID 被复用时视为不健康，不结束那个新进程。句柄在关闭时释放，重复关闭不再释放一次。
+
+看门狗只保护已经证明归属的阶段，并且只在 `origin_timeout_s > 0` 时启动。`set_show(False)` 以及哨兵证明里的 `set_lt_str("file.filename$")` 和 `lt_exec` 都在这之前，是直接 COM 调用，没有截止时间。许可证对话框或首次向导如果卡在这里，`execute_batch` 停在 `session.start()`，调用不返回。这不是返回失败。此时还没有证明过的进程句柄，不能安全结束任何 Origin，也不会为了让调用返回去结束一个未知进程。
+
+启动前有三次“当前没有 Origin”检查：加载 originpro 之前、加载之后，以及活会话枚举到的 PID。这三次不是原子操作，不能排除检查之后、COM 对象真正建起来之前出现的进程。当前安装的 `originpro/config.py` 里，`APP.__getattr__` 在第一次取属性时构造 `OriginExt.Application()`，并执行 `LT_execute('sec -poc')`。`APP.Attach` 的说明是附着已有实例，用的是 `OriginExt.ApplicationSI()`。这条批量路径不调用 `Attach`。文件里只说明默认构造和附着入口不同，不能据此说三次检查已经消除竞争。
+
+`close_origin_app` 在 `exit()` 之后仍最多等 8 秒；等待期间只要还能看到 `Origin64.exe` 或 `Origin.exe` 就继续等。这是旧导出入口的关闭等待，不证明该进程属于本次会话，也不结束未证明的进程。会话自己的收尾只核对已证明的句柄，身份仍成立时才结束那个句柄。这 8 秒的全局可见性等待是已知限制。
 
 `origin.owned_pids` 是本次批次证明过的进程号，按号排序，包含已经关闭的会话。`origin.owned_processes` 是对应的 `pid`、`creation_filetime` 和 `image`。它不是“期间出现过的全部 Origin”。之后若要清理，必须同时匹配创建时间。只提供 PID 的测试替身会记成仅含 `pid` 的条目。
 
@@ -240,7 +246,7 @@ PDF 为 `<opju stem>__g01_<表名最多 40 字符>.pdf`，序号按图形顺序�
 
 任务 `status`：`succeeded`、`failed`、`skipped`、`cancelled`、`blocked`。`blocked` 表示目标已存在且未允许覆盖，已有字节保持不变。
 
-`pdf_status`：`not_applicable`（未请求 PDF，或该任务没有图形）、`ok`、`failed`。检查器只认未压缩的 `/Type /Page` 字节，外加 `%PDF-` 头、`%%EOF`、`startxref` 或 `/XRef`。内容流上的 `/Filter` 不影响这一判断。没有未压缩页、且文件含 `/ObjStm` 时，错误写明不支持 ObjStm。没有未压缩页的其他文件也会被拒绝。这个检查器不解码对象流，也不假装支持压缩页字典。
+`pdf_status`：`not_applicable`（未请求 PDF，或该任务没有图形）、`ok`、`failed`。PDF 恢复被拒绝时，这次结果的 `pdf_status` 是 `failed`，成功记录本身不改。检查器只认未压缩的 `/Type /Page` 字节，外加 `%PDF-` 头、`%%EOF`、`startxref` 或 `/XRef`。内容流上的 `/Filter` 不影响这一判断。没有未压缩页、且文件含 `/ObjStm` 时，错误写明不支持 ObjStm。没有未压缩页的其他文件也会被拒绝。这个检查器不解码对象流，也不假装支持压缩页字典。
 
 PDF 失败时任务仍是 `succeeded`，`error` 为 null，`ok` 为 false。失败原因在结果、进度和记录的 `pdf_errors` 里，每项含 `table`、`graph`、`short_name`、`path`、`message`。已安装的 OPJU 和已经校验通过的 PDF 保留。
 
@@ -314,7 +320,7 @@ proc.join()
 
 - 未请求 PDF，或 `pdf_status` 是 `not_applicable`：任务 `skipped`。
 - 每个记录中的图都有 PDF，哈希与回执一致且仍能通过未压缩页检查：任务 `skipped`。
-- 其中一些 PDF 缺失：在本程序当前证明过的 Origin 会话里只读打开已保存的 OPJU，只补这些图。不调用保存，也不重写 OPJU。补导前后核对 OPJU 哈希；若字节变化，先尝试写回原字节，然后保持成功记录并把 PDF 标为失败。
+- 其中一些 PDF 缺失：先把回执核对过的 OPJU 流式复制到该任务独占的临时目录，再核对副本哈希、源配置和原 OPJU 哈希。COM 只打开这个副本，不打开生产 OPJU，也不保存。自动保存或异常写只会改到这个副本。导出返回后、安装每个 PDF 之前再次核对生产 OPJU。生产文件若已变化，不安装这次的新 PDF，不覆盖成功记录，保留读到的新字节；这次结果是 `blocked`，`pdf_status` 是 `failed`。不会为了让哈希回到旧值而把旧字节写回去。
 - 表长名、图的长短名必须与记录一致，且各只有一个匹配。provenance 必须包含当时的源路径。对不上就不导出另一张图。
 - PDF 已存在但哈希与回执不同，或回执里没有这个文件：结果是 `blocked`，成功记录原样保留。`overwrite=True` 时可以在恢复中替换该 PDF，仍然不重写 OPJU。
 - 源、读取或绘图配置、格式、指纹或 OPJU 字节变化：走完整导出，不进入 PDF 补导。`overwrite` 仍为 false 时，已有 OPJU 使该任务 `blocked`，不改那个文件的字节。

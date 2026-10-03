@@ -908,18 +908,19 @@ class OriginSession:
         return results
 
     def export_saved_pdfs(self, project: Path, graphs: list[dict[str, Any]]) -> list[dict[str, Any]]:
-        """Open a saved project and export only the requested graphs.
+        """Open a private project copy and export only the requested graphs.
 
-        The project is opened read-only. This method does not save it. Each
-        graph must match one sheet long name and one graph identity. A missing
-        or ambiguous match is an error for that graph and does not export a
-        different graph.
+        The caller passes a copy it owns. This method opens that path
+        read-only and does not save it. If those bytes change, they are left
+        in place and are not written back onto this path or any other file.
+        Each graph must match one sheet long name and one graph identity. A
+        missing or ambiguous match is an error for that graph and does not
+        export a different graph.
         """
         if not self.healthy():
             raise OriginSessionLost("Origin session is not running")
         project = Path(project)
-        before_bytes = project.read_bytes()
-        before = hashlib.sha256(before_bytes).hexdigest()
+        before = _sha256_bytes(project)
 
         def work() -> list[dict[str, Any]]:
             opened = self.op.open(str(project), True, False)
@@ -963,10 +964,10 @@ class OriginSession:
 
         try:
             exported = self._call(work)
-        except Exception:
-            _guard_saved_project(project, before_bytes, before)
+        except Exception as exc:
+            _reject_rewritten_open(project, before, exc)
             raise
-        _guard_saved_project(project, before_bytes, before)
+        _reject_rewritten_open(project, before, None)
         return exported
 
     def _call(self, fn):
@@ -1015,31 +1016,15 @@ def _sha256_bytes(path: Path) -> str:
     return digest.hexdigest()
 
 
-def _restore_exact(path: Path, payload: bytes) -> bool:
-    temporary = path.with_name(path.name + ".restore-tmp")
-    try:
-        temporary.write_bytes(payload)
-        os.replace(temporary, path)
-        return _sha256_bytes(path) == hashlib.sha256(payload).hexdigest()
-    except OSError:
-        return False
-    finally:
-        if temporary.exists():
-            temporary.unlink(missing_ok=True)
-
-
-def _guard_saved_project(project: Path, before_bytes: bytes, before_hash: str) -> None:
-    """Restore ``project`` when a PDF-only open changed its bytes."""
+def _reject_rewritten_open(project: Path, before_hash: str, caught: BaseException | None) -> None:
+    """Fail when the opened copy changed, without writing any project path."""
     try:
         after = _sha256_bytes(project)
     except OSError as exc:
-        raise DataImportError(f"PDF recovery could not re-read the saved project: {project}") from exc
+        raise DataImportError(f"PDF recovery could not re-read the opened project: {project}") from exc
     if after == before_hash:
         return
-    if _restore_exact(project, before_bytes):
-        raise DataImportError(
-            f"PDF recovery changed the saved project; the original bytes were restored: {project}"
-        )
     raise DataImportError(
-        f"PDF recovery changed the saved project and the original bytes could not be restored: {project}"
-    )
+        "PDF recovery changed the opened project copy; those bytes were left in place "
+        f"and were not written back: {project}"
+    ) from caught

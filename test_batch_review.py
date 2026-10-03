@@ -19,7 +19,14 @@ from unittest import mock
 
 from openpyxl import Workbook
 
-from origin_bridge.batch import build_batch_request, execute_batch, load_batch_record, log_path_for, read_batch_log
+from origin_bridge.batch import (
+    build_batch_request,
+    execute_batch,
+    load_batch_record,
+    log_path_for,
+    read_batch_log,
+    save_batch_record,
+)
 from origin_bridge.cli import build_parser
 from origin_bridge.exporter import origin_export_lock
 from origin_bridge.models import DataImportError
@@ -264,6 +271,7 @@ class ReviewFixTests(unittest.TestCase):
         )
         self.assertEqual(blocked["counts"]["blocked"], 1)
         self.assertIn("pdf bytes changed", blocked["tasks"][0]["error"]["message"])
+        self.assertEqual(blocked["tasks"][0]["pdf_status"], "failed")
         self.assertEqual(record.read_bytes(), receipt)
         self.assertEqual(second_pdf.read_bytes(), stranger)
         self.assertEqual(opju.read_bytes(), original)
@@ -665,6 +673,513 @@ class ReviewFixTests(unittest.TestCase):
         self.assertEqual(closed, [(op, True)])
         self.assertTrue(op.exited)
         self.assertEqual(session.owned_pids, set())
+
+    def test_recover_fail_indexes_keeps_the_project_and_a_later_resume_fills(self):
+        source = self.workbook(self.root / "retry-one.xlsx")
+        output = self.root / "retry-one-out"
+        plot = {"kind": "line", "x": "x", "y": ["y"]}
+        first = self.export(
+            [source], output, format="opju", pdf=True, plot=plot,
+            session_factory=lambda: FakeSession(pdf_fail_indexes={2}),
+        )
+        task = first["tasks"][0]
+        self.assertEqual(task["pdf_status"], "failed")
+        opju = Path(task["output"]["path"])
+        original = opju.read_bytes()
+        kept = Path(task["pdfs"][0]["path"])
+        kept_bytes = kept.read_bytes()
+        sessions: list[FakeSession] = []
+
+        def failing_recover():
+            session = FakeSession()
+            session.recover_fail_indexes.add(2)
+            sessions.append(session)
+            return session
+
+        failed = self.export(
+            [source], output, format="opju", pdf=True, plot=plot, resume=True,
+            session_factory=failing_recover,
+        )
+        failed_task = failed["tasks"][0]
+        self.assertEqual(failed_task["status"], "succeeded")
+        self.assertIsNone(failed_task["error"])
+        self.assertEqual(failed_task["pdf_status"], "failed")
+        self.assertTrue(failed_task["pdf_errors"])
+        self.assertIn("recover failed", failed_task["pdf_errors"][0]["message"])
+        self.assertEqual([item["index"] for item in failed_task["pdfs"]], [1])
+        self.assertEqual(opju.read_bytes(), original)
+        self.assertEqual(kept.read_bytes(), kept_bytes)
+        self.assertEqual([item["index"] for item in sessions[0].recovered[0]], [2])
+        missing = Path(failed_task["pdf_errors"][0]["path"])
+        self.assertFalse(missing.is_file())
+
+        filled = self.export(
+            [source], output, format="opju", pdf=True, plot=plot, resume=True,
+            session_factory=lambda: FakeSession(),
+        )
+        self.assertEqual(filled["tasks"][0]["pdf_status"], "ok", filled)
+        self.assertEqual(sorted(item["index"] for item in filled["tasks"][0]["pdfs"]), [1, 2])
+        self.assertEqual(opju.read_bytes(), original)
+        self.assertEqual(kept.read_bytes(), kept_bytes)
+        self.assertTrue(missing.is_file())
+
+    def test_record_without_graph_identities_uses_resolved_plot(self):
+        source = self.write_csv(self.root / "legacy.csv", "x,y\n0,1\n1,4\n")
+        output = self.root / "legacy-out"
+        plot = {"kind": "line", "x": "x", "y": ["y"], "title": "Legacy"}
+        first = self.export(
+            [source], output, format="opju", pdf=True, plot=plot, session_factory=lambda: FakeSession(),
+        )
+        task = first["tasks"][0]
+        opju = Path(task["output"]["path"])
+        original = opju.read_bytes()
+        pdf = Path(task["pdfs"][0]["path"])
+        pdf.unlink()
+        record_path = Path(first["record_path"])
+        stored = load_batch_record(record_path)
+        entry = stored["tasks"][task["task_id"]]
+        self.assertTrue(entry.get("graph_identities"))
+        resolved = [item for item in entry["resolved_plot"] if item.get("kind") != "none"]
+        self.assertEqual(len(resolved), 1)
+        entry.pop("graph_identities")
+        save_batch_record(record_path, stored)
+        sessions: list[FakeSession] = []
+
+        def factory():
+            session = FakeSession()
+            sessions.append(session)
+            return session
+
+        filled = self.export(
+            [source], output, format="opju", pdf=True, plot=plot, resume=True, session_factory=factory,
+        )
+        self.assertEqual(filled["tasks"][0]["pdf_status"], "ok", filled)
+        self.assertEqual(opju.read_bytes(), original)
+        requested = sessions[-1].recovered[0][0]
+        self.assertEqual(requested["table"], resolved[0]["table"])
+        self.assertEqual(requested["graph"], resolved[0]["title"] or resolved[0]["table"])
+        self.assertEqual(requested["short_name"], "")
+        self.assertGreaterEqual(validate_pdf_file(pdf)["pages"], 1)
+
+    def test_snapshot_copy_leaves_a_mismatched_source_in_place(self):
+        from origin_bridge import batch as batch_mod
+
+        stage = getattr(batch_mod, "_stage_recovery_snapshot", None)
+        if stage is None:
+            self.fail("recovery does not stage a verified snapshot")
+        src = self.root / "source.opju"
+        payload = b"ORIGINAL-OPJU-BYTES"
+        src.write_bytes(payload)
+        expected = hashlib.sha256(payload).hexdigest()
+        src.write_bytes(b"FOREIGN_DURING_COPY")
+        dest = self.root / "snap" / "snapshot.opju"
+        with self.assertRaises(DataImportError) as caught:
+            stage(src, dest, expected)
+        self.assertEqual(src.read_bytes(), b"FOREIGN_DURING_COPY")
+        self.assertNotIn("restored", str(caught.exception).lower())
+        self.assertIn("left in place", str(caught.exception))
+
+    def test_export_saved_pdfs_rejects_open_provenance_and_ambiguity_without_restoring(self):
+        project = self.root / "direct.opju"
+        original = b"OPJU-ORIGINAL-BYTES-0123456789"
+        project.write_bytes(original)
+        source = self.write_csv(self.root / "direct.csv")
+        source_name = str(source.resolve())
+        dest = self.root / "direct.pdf"
+        request = [{
+            "table": "direct",
+            "graph": "direct",
+            "short_name": "G1",
+            "source_name": source_name,
+            "dest": str(dest),
+        }]
+
+        class Closed:
+            def open(self, path, *_args):
+                return False
+
+            def pages(self, _kind):
+                raise AssertionError("pages were read after Origin refused to open")
+
+        session = _armed_session(Closed())
+        with self.assertRaisesRegex(DataImportError, "did not open"):
+            session.export_saved_pdfs(project, request)
+        self.assertEqual(project.read_bytes(), original)
+        self.assertFalse(dest.exists())
+
+        class MutatingClosed:
+            def open(self, path, *_args):
+                Path(path).write_bytes(b"FOREIGN_OPEN_FAIL")
+                return False
+
+            def pages(self, _kind):
+                raise AssertionError("pages were read after Origin refused to open")
+
+        project.write_bytes(original)
+        session = _armed_session(MutatingClosed())
+        with self.assertRaises(DataImportError) as caught:
+            session.export_saved_pdfs(project, request)
+        self.assertNotIn("restored", str(caught.exception).lower())
+        self.assertIn("left in place", str(caught.exception))
+        self.assertEqual(project.read_bytes(), b"FOREIGN_OPEN_FAIL")
+        self.assertFalse(dest.exists())
+
+        project.write_bytes(original)
+        decoy = _Graph("G1", "direct")
+        com = _Com(
+            books=[_Book([
+                _Sheet("direct", [[]]),
+                _Sheet("Import Provenance", [["unrelated-source"]]),
+            ])],
+            graphs=[decoy],
+        )
+        session = _armed_session(com)
+        with self.assertRaisesRegex(DataImportError, "provenance"):
+            session.export_saved_pdfs(project, request)
+        self.assertEqual(decoy.saves, [])
+        self.assertEqual(project.read_bytes(), original)
+        self.assertFalse(dest.exists())
+
+        project.write_bytes(original)
+        wrong = _Graph("G9", "not-the-recorded-graph")
+        com = _Com(
+            books=[_Book([
+                _Sheet("direct", [[]]),
+                _Sheet("Import Provenance", [[source_name]]),
+            ])],
+            graphs=[wrong],
+        )
+        session = _armed_session(com)
+        refused = session.export_saved_pdfs(project, request)
+        self.assertEqual(len(refused), 1)
+        self.assertFalse(refused[0]["ok"])
+        self.assertIn("unique", refused[0]["error"])
+        self.assertEqual(wrong.saves, [])
+        self.assertEqual(project.read_bytes(), original)
+        self.assertFalse(dest.exists())
+
+        project.write_bytes(original)
+        first = _Graph("G1", "direct")
+        second = _Graph("G1", "direct")
+        com = _Com(
+            books=[_Book([
+                _Sheet("direct", [[]]),
+                _Sheet("direct", [[]]),
+                _Sheet("Import Provenance", [[source_name]]),
+            ])],
+            graphs=[first, second],
+        )
+        session = _armed_session(com)
+        ambiguous = session.export_saved_pdfs(project, request)
+        self.assertFalse(ambiguous[0]["ok"])
+        self.assertIn("unique", ambiguous[0]["error"])
+        self.assertEqual(first.saves, [])
+        self.assertEqual(second.saves, [])
+        self.assertEqual(project.read_bytes(), original)
+        self.assertFalse(dest.exists())
+
+    def test_foreign_update_during_recovery_is_left_in_place(self):
+        source, output, plot, opju, original, kept, kept_bytes, record, receipt, missing = self._partial_pdf(self.root / "foreign")
+        seen = []
+
+        def on_open(path: Path) -> None:
+            seen.append(Path(path).read_bytes())
+            opju.write_bytes(b"FOREIGN_UPDATE")
+
+        com = _com_for_record(load_batch_record(record), source, on_open=on_open)
+        resumed = self.export(
+            [source], output, format="opju", pdf=True, plot=plot, resume=True,
+            session_factory=lambda: ProbeSession(com),
+        )
+        task = resumed["tasks"][0]
+        message = task["error"]["message"] if task["error"] else ""
+        self.assertEqual(task["status"], "blocked", resumed)
+        self.assertEqual(task["pdf_status"], "failed", resumed)
+        self.assertIn("left in place", message)
+        self.assertNotIn("restored", message.lower())
+        self.assertEqual(opju.read_bytes(), b"FOREIGN_UPDATE")
+        self.assertEqual(kept.read_bytes(), kept_bytes)
+        self.assertFalse(missing.is_file())
+        self.assertEqual(record.read_bytes(), receipt)
+        self.assertTrue(com.opened)
+        self.assertTrue(all(not _same_path(path, opju) for path in com.opened))
+        self.assertTrue(all(path.name == "snapshot.opju" for path in com.opened))
+        self.assertEqual(seen, [original])
+        self.assertFalse(list(opju.parent.glob("*.restore-tmp")))
+
+    def test_project_replaced_before_snapshot_open_is_not_opened(self):
+        source, output, plot, opju, _original, kept, kept_bytes, record, receipt, missing = self._partial_pdf(self.root / "before-open")
+
+        def on_start() -> None:
+            opju.write_bytes(b"FOREIGN_BEFORE_OPEN")
+
+        com = _com_for_record(load_batch_record(record), source)
+        resumed = self.export(
+            [source], output, format="opju", pdf=True, plot=plot, resume=True,
+            session_factory=lambda: ProbeSession(com, on_start=on_start),
+        )
+        task = resumed["tasks"][0]
+        message = task["error"]["message"] if task["error"] else ""
+        self.assertEqual(task["status"], "blocked", resumed)
+        self.assertEqual(task["pdf_status"], "failed")
+        self.assertIn("left in place", message)
+        self.assertNotIn("restored", message.lower())
+        self.assertEqual(opju.read_bytes(), b"FOREIGN_BEFORE_OPEN")
+        self.assertEqual(kept.read_bytes(), kept_bytes)
+        self.assertFalse(missing.is_file())
+        self.assertEqual(record.read_bytes(), receipt)
+        self.assertEqual(com.opened, [])
+
+    def test_project_replaced_after_snapshot_copy_is_not_opened(self):
+        from origin_bridge import batch as batch_mod
+
+        stage = getattr(batch_mod, "_stage_recovery_snapshot", None)
+        if stage is None:
+            self.fail("recovery does not stage a verified snapshot")
+        source, output, plot, opju, _original, kept, kept_bytes, record, receipt, missing = self._partial_pdf(self.root / "during-copy")
+
+        def wrapper(src, dest, expected):
+            stage(src, dest, expected)
+            Path(src).write_bytes(b"FOREIGN_DURING_COPY")
+
+        com = _com_for_record(load_batch_record(record), source)
+        with mock.patch.object(batch_mod, "_stage_recovery_snapshot", wrapper):
+            resumed = self.export(
+                [source], output, format="opju", pdf=True, plot=plot, resume=True,
+                session_factory=lambda: ProbeSession(com),
+            )
+        task = resumed["tasks"][0]
+        message = task["error"]["message"] if task["error"] else ""
+        self.assertEqual(task["status"], "blocked", resumed)
+        self.assertEqual(task["pdf_status"], "failed")
+        self.assertIn("left in place", message)
+        self.assertNotIn("restored", message.lower())
+        self.assertEqual(opju.read_bytes(), b"FOREIGN_DURING_COPY")
+        self.assertEqual(kept.read_bytes(), kept_bytes)
+        self.assertFalse(missing.is_file())
+        self.assertEqual(record.read_bytes(), receipt)
+        self.assertEqual(com.opened, [])
+
+    def test_project_replaced_before_install_is_not_installed(self):
+        source, output, plot, opju, original, kept, kept_bytes, record, receipt, missing = self._partial_pdf(self.root / "before-install")
+
+        def on_save(_dest) -> None:
+            opju.write_bytes(b"FOREIGN_BEFORE_INSTALL")
+
+        com = _com_for_record(load_batch_record(record), source, on_save=on_save)
+        opened_bytes: list[bytes] = []
+        original_open = com.open
+
+        def open_and_remember(path, *args):
+            opened_bytes.append(Path(path).read_bytes())
+            return original_open(path, *args)
+
+        com.open = open_and_remember
+        resumed = self.export(
+            [source], output, format="opju", pdf=True, plot=plot, resume=True,
+            session_factory=lambda: ProbeSession(com),
+        )
+        task = resumed["tasks"][0]
+        message = task["error"]["message"] if task["error"] else ""
+        self.assertEqual(task["status"], "blocked", resumed)
+        self.assertEqual(task["pdf_status"], "failed")
+        self.assertIn("left in place", message)
+        self.assertNotIn("restored", message.lower())
+        self.assertEqual(opju.read_bytes(), b"FOREIGN_BEFORE_INSTALL")
+        self.assertEqual(kept.read_bytes(), kept_bytes)
+        self.assertFalse(missing.is_file())
+        self.assertEqual(record.read_bytes(), receipt)
+        self.assertTrue(com.opened)
+        self.assertTrue(all(not _same_path(path, opju) for path in com.opened))
+        self.assertEqual(opened_bytes, [original])
+
+    def test_com_error_dirties_only_the_snapshot_and_the_batch_continues(self):
+        source, output, plot, opju, original, kept, kept_bytes, record, _receipt, missing = self._partial_pdf(self.root / "snapshot-error")
+        follower = self.write_csv(self.root / "snapshot-error" / "next.csv", "x,y\n0,5\n1,6\n")
+        com = _com_for_record(load_batch_record(record), source)
+
+        def on_open(path: Path) -> None:
+            if _same_path(path, opju):
+                raise AssertionError("recovery opened the production project")
+            path.write_bytes(path.read_bytes() + b"\nCOM")
+            raise RuntimeError("com broke snapshot")
+
+        com.on_open = on_open
+        resumed = self.export(
+            [source, follower], output, format="opju", pdf=True, plot=plot, resume=True,
+            session_factory=lambda: ProbeSession(com),
+        )
+        by_name = {Path(item["source"]).name: item for item in resumed["tasks"]}
+        failed = by_name[source.name]
+        message = " ".join(
+            [failed["pdf_errors"][0]["message"] if failed["pdf_errors"] else ""]
+            + [failed["error"]["message"] if failed["error"] else ""]
+        )
+        self.assertEqual(failed["status"], "succeeded", resumed)
+        self.assertEqual(failed["pdf_status"], "failed")
+        self.assertNotIn("restored", message.lower())
+        self.assertTrue("not written back" in message or "com broke snapshot" in message)
+        self.assertEqual(opju.read_bytes(), original)
+        self.assertEqual(kept.read_bytes(), kept_bytes)
+        self.assertFalse(missing.is_file())
+        self.assertEqual(load_batch_record(record)["tasks"][failed["task_id"]]["output"]["sha256"], hashlib.sha256(original).hexdigest())
+        self.assertTrue(com.opened)
+        self.assertTrue(all(not _same_path(path, opju) for path in com.opened))
+        self.assertEqual(by_name["next.csv"]["status"], "succeeded", resumed)
+        self.assertTrue(Path(by_name["next.csv"]["output"]["path"]).is_file())
+
+    def _partial_pdf(self, folder: Path):
+        folder.mkdir(parents=True, exist_ok=True)
+        source = self.workbook(folder / "book.xlsx")
+        output = folder / "out"
+        plot = {"kind": "line", "x": "x", "y": ["y"]}
+        first = self.export(
+            [source], output, format="opju", pdf=True, plot=plot,
+            session_factory=lambda: FakeSession(pdf_fail_indexes={2}),
+        )
+        task = first["tasks"][0]
+        self.assertEqual(task["status"], "succeeded", first)
+        self.assertEqual(task["pdf_status"], "failed", first)
+        self.assertEqual(len(task["pdfs"]), 1)
+        opju = Path(task["output"]["path"])
+        kept = Path(task["pdfs"][0]["path"])
+        record = Path(first["record_path"])
+        stored = load_batch_record(record)
+        missing_identity = next(
+            item for item in stored["tasks"][task["task_id"]]["graph_identities"]
+            if item["index"] != task["pdfs"][0]["index"]
+        )
+        from origin_bridge.batch import _pdf_target
+
+        missing = _pdf_target(opju, int(missing_identity["index"]), str(missing_identity["table"]))
+        self.assertFalse(missing.is_file())
+        return source, output, plot, opju, opju.read_bytes(), kept, kept.read_bytes(), record, record.read_bytes(), missing
+
+
+def _same_path(left, right) -> bool:
+    return os.path.normcase(str(Path(left).resolve())) == os.path.normcase(str(Path(right).resolve()))
+
+
+def _armed_session(op) -> OriginSession:
+    session = OriginSession(timeout_s=0)
+    session.op = op
+    session.started = True
+    session._alive = True
+    session._live = False
+    session._closed = False
+    return session
+
+
+class _Sheet:
+    def __init__(self, lname: str, columns: list[list]):
+        self.lname = lname
+        self.cols = len(columns)
+        self._columns = [list(column) for column in columns]
+
+    def to_list(self, index: int):
+        return list(self._columns[index])
+
+
+class _Book:
+    def __init__(self, sheets: list[_Sheet]):
+        self._sheets = list(sheets)
+
+    def __iter__(self):
+        return iter(self._sheets)
+
+
+class _Graph:
+    def __init__(self, short: str, long_name: str, on_save=None):
+        self.name = short
+        self.lname = long_name
+        self.obj = None
+        self.saves: list[str] = []
+        self.on_save = on_save
+
+    def save_fig(self, dest, replace=False):
+        del replace
+        self.saves.append(str(dest))
+        if self.on_save:
+            self.on_save(dest)
+        path = Path(dest)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_bytes(PDF)
+        return str(path)
+
+
+class _Com:
+    def __init__(self, *, books, graphs, on_open=None, on_save=None):
+        self.books = books
+        self.graphs = graphs
+        self.on_open = on_open
+        self.on_save = on_save
+        self.opened: list[Path] = []
+
+    def open(self, path, *_args):
+        opened = Path(path)
+        self.opened.append(opened)
+        if self.on_open:
+            self.on_open(opened)
+        return True
+
+    def pages(self, kind):
+        if kind == "w":
+            return self.books
+        if kind == "g":
+            return self.graphs
+        return []
+
+
+def _com_for_record(record: dict, source: Path, *, on_open=None, on_save=None) -> _Com:
+    entry = next(iter(record["tasks"].values()))
+    sheets = [_Sheet(str(item["table"]), [[]]) for item in entry["graph_identities"]]
+    sheets.append(_Sheet("Import Provenance", [[str(source.resolve())]]))
+    graphs = [
+        _Graph(str(item.get("short_name") or ""), str(item["graph"]), on_save=on_save)
+        for item in entry["graph_identities"]
+    ]
+    return _Com(books=[_Book(sheets)], graphs=graphs, on_open=on_open, on_save=on_save)
+
+
+class ProbeSession(OriginSession):
+    """Run the real PDF recovery method against a COM stand-in."""
+
+    def __init__(self, com: _Com, *, on_start=None):
+        super().__init__(timeout_s=0)
+        self._com = com
+        self._on_start = on_start
+        self.starts = 0
+        self.stops = 0
+        self._on = False
+
+    def start(self) -> None:
+        if self._on_start:
+            self._on_start()
+        self.op = self._com
+        self.started = True
+        self._alive = True
+        self._live = False
+        self._closed = False
+        self._on = True
+        self.starts += 1
+
+    def close(self) -> None:
+        if self._on:
+            self.stops += 1
+        self._on = False
+        self.started = False
+        self._alive = False
+        self._closed = True
+
+    def healthy(self) -> bool:
+        return self._on and self.op is not None
+
+    def write_project(self, stage_dir, tables, prepared, converted, *, pdf=False, conversion_notes=None):
+        fake = FakeSession()
+        fake._on = True
+        return fake.write_project(
+            stage_dir, tables, prepared, converted, pdf=pdf, conversion_notes=conversion_notes,
+        )
 
 
 if __name__ == "__main__":

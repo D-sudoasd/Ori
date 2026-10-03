@@ -1085,7 +1085,7 @@ def _report_preserved_block(
         "status": "blocked",
         "output": None,
         "pdfs": [],
-        "pdf_status": "not_applicable",
+        "pdf_status": "failed",
         "pdf_errors": list(pdf_errors or []),
         "error": error,
         "warnings": [],
@@ -1101,22 +1101,9 @@ def _report_preserved_block(
         "source": task.get("source"),
         "output": task.get("output"),
         "error": error,
-        "pdf_status": "not_applicable",
+        "pdf_status": "failed",
         "pdf_errors": list(pdf_errors or []),
     })
-
-
-def _restore_exact(path: Path, payload: bytes) -> bool:
-    temporary = path.with_name(path.name + ".restore-tmp")
-    try:
-        temporary.write_bytes(payload)
-        os.replace(temporary, path)
-        return hashlib.sha256(path.read_bytes()).hexdigest() == hashlib.sha256(payload).hexdigest()
-    except OSError:
-        return False
-    finally:
-        if temporary.exists():
-            temporary.unlink(missing_ok=True)
 
 
 def _pdf_failed_keep(session, since_start, stored, decision, source_hash, message: str) -> dict[str, Any]:
@@ -1155,8 +1142,75 @@ def _preserve_outcome(session, since_start, reason: str) -> dict[str, Any]:
     }
 
 
+def _recovery_config_ok(stored: Mapping[str, Any], task: Mapping[str, Any], job: Mapping[str, Any]) -> bool:
+    """Re-check the recorded source configuration before opening a snapshot."""
+    if _canonical(stored.get("read_options")) != _canonical(task["read_options"]):
+        return False
+    if _canonical(stored.get("plot")) != _canonical(task["plot"]):
+        return False
+    if stored.get("format") != job["format"] or bool(stored.get("pdf")) != bool(job["pdf"]):
+        return False
+    output = stored.get("output") or {}
+    return str(output.get("path") or "") == str(task["output"])
+
+
+def _stage_recovery_snapshot(src: Path, dest: Path, expected_hash: str) -> None:
+    """Stream-copy ``src`` into ``dest`` without writing ``src``.
+
+    The bytes written, a fresh read of ``src``, and ``dest`` must all hash to
+    ``expected_hash``. A mismatch leaves the bytes found on ``src``.
+    """
+    dest.parent.mkdir(parents=True, exist_ok=True)
+    digest = hashlib.sha256()
+    try:
+        with src.open("rb") as inp, dest.open("wb") as out:
+            while True:
+                block = inp.read(1024 * 1024)
+                if not block:
+                    break
+                out.write(block)
+                digest.update(block)
+    except OSError as exc:
+        raise DataImportError(f"PDF recovery could not copy the saved project: {exc}") from exc
+    try:
+        again = _sha256_file(src)
+        staged = _sha256_file(dest)
+    except OSError as exc:
+        raise DataImportError(f"PDF recovery could not re-read the saved project: {exc}") from exc
+    if digest.hexdigest() != expected_hash or again != expected_hash or staged != expected_hash:
+        raise DataImportError(
+            "saved project changed while copying the recovery snapshot; the new bytes were left in place"
+        )
+
+
+def _source_conflict(path: Path, expected_hash: str) -> str | None:
+    try:
+        current = _sha256_file(path)
+    except OSError as exc:
+        return f"PDF recovery could not re-read the source: {exc}"
+    if current != expected_hash:
+        return "source changed during PDF recovery; the saved project was not rewritten"
+    return None
+
+
+def _production_conflict(path: Path, expected_hash: str) -> str | None:
+    """Return a conflict message when the saved project is no longer ``expected_hash``."""
+    try:
+        current = _sha256_file(path)
+    except OSError as exc:
+        return f"PDF recovery could not re-read the saved project: {exc}"
+    if current != expected_hash:
+        return "saved project changed during PDF recovery; the new bytes were left in place"
+    return None
+
+
 def _recover_one(job, task, decision, state, session, session_factory, since_start) -> dict[str, Any]:
-    """Export missing PDFs from the saved project without rewriting that project."""
+    """Export missing PDFs from a private copy of the saved project.
+
+    Origin opens only that copy. The production project is never a write
+    target: a change found on it is left in place, no new PDF is installed,
+    and the success receipt is not replaced.
+    """
     from .exporter import _install_staged_file
     from .session import validate_pdf_file
 
@@ -1165,12 +1219,13 @@ def _recover_one(job, task, decision, state, session, session_factory, since_sta
     source = Path(task["source"])
     try:
         source_hash = _sha256_file(source)
-        snapshot = output.read_bytes()
+        opju_hash = _sha256_file(output)
     except OSError as exc:
         return _preserve_outcome(session, since_start, f"PDF recovery could not read source or project: {exc}")
-    opju_hash = hashlib.sha256(snapshot).hexdigest()
     if source_hash != stored.get("source_sha256") or opju_hash != (stored.get("output") or {}).get("sha256"):
         return _preserve_outcome(session, since_start, "source or project bytes changed before PDF recovery")
+    if not _recovery_config_ok(stored, task, job):
+        return _preserve_outcome(session, since_start, "source configuration changed before PDF recovery")
     started_new = False
     if session is None or not session.healthy():
         if session is not None:
@@ -1193,6 +1248,20 @@ def _recover_one(job, task, decision, state, session, session_factory, since_sta
         since_start = 0
     stage_dir = Path(tempfile.mkdtemp(prefix=f".{output.stem}_pdf_", dir=str(output.parent)))
     try:
+        conflict = _production_conflict(output, opju_hash) or _source_conflict(source, source_hash)
+        if conflict or not _recovery_config_ok(stored, task, job):
+            return _preserve_outcome(
+                session, since_start,
+                conflict or "source configuration changed before PDF recovery",
+            )
+        snapshot_path = stage_dir / "snapshot.opju"
+        try:
+            _stage_recovery_snapshot(output, snapshot_path, opju_hash)
+        except DataImportError as exc:
+            return _preserve_outcome(session, since_start, str(exc))
+        conflict = _production_conflict(output, opju_hash) or _source_conflict(source, source_hash)
+        if conflict:
+            return _preserve_outcome(session, since_start, conflict)
         graphs = []
         for item in decision.get("export") or []:
             dest = stage_dir / f"recover_{int(item['index']):02d}.pdf"
@@ -1206,37 +1275,32 @@ def _recover_one(job, task, decision, state, session, session_factory, since_sta
                 "final": item["path"],
             })
         try:
-            written = list(session.export_saved_pdfs(output, graphs))
+            written = list(session.export_saved_pdfs(snapshot_path, graphs))
         except Exception as exc:
-            try:
-                current = hashlib.sha256(output.read_bytes()).hexdigest()
-            except OSError:
-                return _preserve_outcome(
-                    session, since_start, f"PDF recovery could not re-read the saved project: {exc}",
-                )
-            if current != opju_hash and not _restore_exact(output, snapshot):
-                return _preserve_outcome(
-                    session, since_start, f"PDF recovery changed the saved project and it could not be restored: {exc}",
-                )
+            conflict = _production_conflict(output, opju_hash)
+            if conflict:
+                return _preserve_outcome(session, since_start, f"{conflict}: {exc}")
             return _pdf_failed_keep(
                 session, since_start, stored, decision, source_hash, str(exc) or exc.__class__.__name__,
             )
         if len(written) != len(graphs):
+            conflict = _production_conflict(output, opju_hash)
+            if conflict:
+                return _preserve_outcome(session, since_start, conflict)
             return _pdf_failed_keep(
                 session, since_start, stored, decision, source_hash,
                 "PDF recovery did not return one result for each requested graph",
             )
-        if hashlib.sha256(output.read_bytes()).hexdigest() != opju_hash:
-            if not _restore_exact(output, snapshot):
-                return _preserve_outcome(session, since_start, "PDF recovery changed the saved project")
-            return _pdf_failed_keep(
-                session, since_start, stored, decision, source_hash,
-                "PDF recovery changed the saved project; the original bytes were restored",
-            )
+        conflict = _production_conflict(output, opju_hash)
+        if conflict:
+            return _preserve_outcome(session, since_start, conflict)
         installed: list[dict[str, Any]] = []
         errors: list[dict[str, Any]] = []
         for spec, item in zip(graphs, written):
             final = Path(spec["final"])
+            conflict = _production_conflict(output, opju_hash)
+            if conflict:
+                return _preserve_outcome(session, since_start, conflict)
             if not item.get("ok") or not item.get("staged"):
                 errors.append(_pdf_error(spec, final, str(item.get("error") or "PDF export failed")))
                 continue
@@ -1258,13 +1322,9 @@ def _recover_one(job, task, decision, state, session, session_factory, since_sta
                 "index": spec["index"],
                 "header": checked["header"],
             })
-        if hashlib.sha256(output.read_bytes()).hexdigest() != opju_hash:
-            if not _restore_exact(output, snapshot):
-                return _preserve_outcome(session, since_start, "PDF install changed the saved project")
-            return _pdf_failed_keep(
-                session, since_start, stored, decision, source_hash,
-                "PDF install changed the saved project; the original bytes were restored",
-            )
+        conflict = _production_conflict(output, opju_hash)
+        if conflict:
+            return _preserve_outcome(session, since_start, conflict)
         merged = list(decision.get("keep_pdfs") or []) + installed
         merged.sort(key=lambda item: int(item.get("index") or 0))
         expected = len(decision.get("keep_pdfs") or []) + len(graphs)
