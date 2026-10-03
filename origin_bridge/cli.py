@@ -72,7 +72,7 @@ def build_parser() -> argparse.ArgumentParser:
     batch.add_argument("--origin-retries", type=int, default=1, help="Origin 会话丢失后的额外尝试次数")
     batch.add_argument("--output-name", help="仅 unified 布局使用的输出文件名")
     batch.add_argument("--retry-failed", action="store_true",
-                       help="续跑并丢掉失败、取消和阻塞记录，使这些任务再次执行")
+                       help="续跑，并丢掉失败、取消和阻塞记录使这些任务重跑。已成功但 PDF 失败或缺失的任务保留 OPJU 回执，只补 PDF")
     return parser
 
 

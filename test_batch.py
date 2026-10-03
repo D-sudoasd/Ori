@@ -39,13 +39,16 @@ PDF = b"%PDF-1.4\n1 0 obj << /Type /Page >> endobj\nstartxref\n0\n%%EOF\n"
 
 
 class FakeSession:
-    def __init__(self, *, lose=False, pdf_error=False):
+    def __init__(self, *, lose=False, pdf_error=False, pdf_fail_indexes=()):
         self.starts = 0
         self.stops = 0
         self.owned_pids = [71001]
         self.lose = lose
         self.pdf_error = pdf_error
+        self.pdf_fail_indexes = set(pdf_fail_indexes)
         self.pdf_requests: list[bool] = []
+        self.recovered: list[list[dict]] = []
+        self.recover_fail_indexes = set()
         self._on = False
 
     def start(self) -> None:
@@ -73,22 +76,62 @@ class FakeSession:
         opju.write_bytes(b"OPJU" + tables[0].name.encode("utf-8"))
         pdfs = []
         if pdf:
-            if self.pdf_error:
-                pdfs.append({
-                    "ok": False, "staged": None, "table": tables[0].name,
-                    "graph": "g", "error": "pdf boom",
-                })
-            else:
-                for index, item in enumerate(tables, start=1):
-                    if item.plot.kind == "none":
-                        continue
-                    target = stage / f"graph_{index:02d}.pdf"
-                    target.write_bytes(PDF)
+            graph_index = 0
+            for item in tables:
+                if item.plot.kind == "none":
+                    continue
+                graph_index += 1
+                title = item.plot.title or item.name
+                identity = {
+                    "table": item.name,
+                    "graph": title,
+                    "short_name": f"G{graph_index}",
+                    "index": graph_index,
+                }
+                if self.pdf_error or graph_index in self.pdf_fail_indexes:
                     pdfs.append({
-                        "ok": True, "staged": str(target), "table": item.name,
-                        "graph": item.plot.title or item.name, "pages": 1,
+                        "ok": False, "staged": None, "pages": 0, "error": "pdf boom", **identity,
                     })
+                    continue
+                target = stage / f"graph_{graph_index:02d}.pdf"
+                target.write_bytes(PDF)
+                pdfs.append({"ok": True, "staged": str(target), "pages": 1, **identity})
         return {"opju": opju, "pdfs": pdfs, "warnings": [], "session_lost": False}
+
+    def export_saved_pdfs(self, project, graphs):
+        if not self._on:
+            raise OriginSessionLost("not running")
+        project = Path(project)
+        before = project.read_bytes()
+        self.recovered.append([dict(item) for item in graphs])
+        results = []
+        for item in graphs:
+            if int(item.get("index") or 0) in self.recover_fail_indexes:
+                results.append({
+                    "ok": False,
+                    "staged": None,
+                    "pages": 0,
+                    "table": item.get("table") or "",
+                    "graph": item.get("graph") or "",
+                    "short_name": item.get("short_name") or "",
+                    "error": "recover failed",
+                })
+                continue
+            dest = Path(item["dest"])
+            dest.parent.mkdir(parents=True, exist_ok=True)
+            dest.write_bytes(PDF)
+            results.append({
+                "ok": True,
+                "staged": dest,
+                "pages": 1,
+                "table": item.get("table") or "",
+                "graph": item.get("graph") or "",
+                "short_name": item.get("short_name") or "",
+            })
+        if project.read_bytes() != before:
+            project.write_bytes(before)
+            raise RuntimeError("PDF recovery changed the saved project")
+        return results
 
 
 class BatchCoreTests(unittest.TestCase):

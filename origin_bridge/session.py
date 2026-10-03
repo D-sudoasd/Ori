@@ -1,18 +1,25 @@
 """One Origin process owned by this program, reused across batch tasks.
 
-The session refuses an Origin process it did not start. A timeout or a forced
-stop terminates only those recorded process ids. It never issues a global
-``taskkill`` of Origin.
+The session refuses an Origin process it did not start. Ownership is the
+process that holds a sentinel file opened by this COM instance, checked with
+the Windows Restart Manager, then pinned by a process handle and its creation
+time. A timeout or a forced stop terminates only that handle. An unproven
+process is never terminated. This module never issues a global ``taskkill``.
 """
 
 from __future__ import annotations
 
 import ctypes
+import hashlib
+import os
 import re
+import shutil
 import sys
+import tempfile
 import threading
 import time
 from pathlib import Path
+from types import SimpleNamespace
 from typing import Any
 
 from .models import DataImportError, PlannedTable, PreparedImport
@@ -107,17 +114,71 @@ def _origin_pids_windows() -> set[int]:
         return found
 
 
+class _FILETIME(ctypes.Structure):
+    _fields_ = [
+        ("dwLowDateTime", ctypes.c_uint),
+        ("dwHighDateTime", ctypes.c_uint),
+    ]
+
+
+def _filetime_int(value: _FILETIME) -> int:
+    return (int(value.dwHighDateTime) << 32) | int(value.dwLowDateTime)
+
+
+_KERNEL_LOCK = threading.Lock()
+_KERNEL = None
+_PROCESS_QUERY = 0x1000
+_PROCESS_TERMINATE = 0x0001
+_STILL_ACTIVE = 259
+_OWNERSHIP_ERROR = (
+    "Could not prove which Origin process belongs to this COM instance; "
+    "no candidate process was terminated"
+)
+
+
+def _kernel32():
+    """Private kernel32 binding for process handles.
+
+    Prototypes stay on this object. Callers do not use the shared ``windll``
+    binding, and they do not build a new Structure class per call.
+    """
+    global _KERNEL
+    with _KERNEL_LOCK:
+        if _KERNEL is None:
+            library = ctypes.WinDLL("kernel32", use_last_error=True)
+            library.OpenProcess.argtypes = [ctypes.c_uint, ctypes.c_int, ctypes.c_uint]
+            library.OpenProcess.restype = ctypes.c_void_p
+            library.TerminateProcess.argtypes = [ctypes.c_void_p, ctypes.c_uint]
+            library.TerminateProcess.restype = ctypes.c_int
+            library.CloseHandle.argtypes = [ctypes.c_void_p]
+            library.CloseHandle.restype = ctypes.c_int
+            library.GetProcessTimes.argtypes = [
+                ctypes.c_void_p,
+                ctypes.POINTER(_FILETIME),
+                ctypes.POINTER(_FILETIME),
+                ctypes.POINTER(_FILETIME),
+                ctypes.POINTER(_FILETIME),
+            ]
+            library.GetProcessTimes.restype = ctypes.c_int
+            library.GetExitCodeProcess.argtypes = [ctypes.c_void_p, ctypes.POINTER(ctypes.c_ulong)]
+            library.GetExitCodeProcess.restype = ctypes.c_int
+            library.QueryFullProcessImageNameW.argtypes = [
+                ctypes.c_void_p,
+                ctypes.c_uint,
+                ctypes.c_wchar_p,
+                ctypes.POINTER(ctypes.c_uint),
+            ]
+            library.QueryFullProcessImageNameW.restype = ctypes.c_int
+            _KERNEL = library
+        return _KERNEL
+
+
 def terminate_pid(pid: int) -> bool:
     """Stop one process id. This does not look up Origin by image name."""
     if sys.platform != "win32" or isinstance(pid, bool) or not isinstance(pid, int) or pid <= 0:
         return False
-    kernel32 = ctypes.windll.kernel32
-    kernel32.OpenProcess.restype = ctypes.c_void_p
-    kernel32.OpenProcess.argtypes = [ctypes.c_uint, ctypes.c_int, ctypes.c_uint]
-    kernel32.TerminateProcess.argtypes = [ctypes.c_void_p, ctypes.c_uint]
-    kernel32.TerminateProcess.restype = ctypes.c_int
-    kernel32.CloseHandle.argtypes = [ctypes.c_void_p]
-    handle = kernel32.OpenProcess(0x0001, 0, int(pid))
+    kernel32 = _kernel32()
+    handle = kernel32.OpenProcess(_PROCESS_TERMINATE, 0, int(pid))
     if not handle:
         return False
     try:
@@ -126,8 +187,289 @@ def terminate_pid(pid: int) -> bool:
         kernel32.CloseHandle(handle)
 
 
+def handle_status(handle) -> dict[str, Any] | None:
+    """Creation time and liveness of a process handle this program already holds."""
+    if sys.platform != "win32" or not handle:
+        return None
+    kernel32 = _kernel32()
+    created = _FILETIME()
+    exited = _FILETIME()
+    kernel_time = _FILETIME()
+    user_time = _FILETIME()
+    if not kernel32.GetProcessTimes(
+        handle, ctypes.byref(created), ctypes.byref(exited), ctypes.byref(kernel_time), ctypes.byref(user_time),
+    ):
+        return None
+    code = ctypes.c_ulong()
+    alive = True
+    if kernel32.GetExitCodeProcess(handle, ctypes.byref(code)):
+        alive = int(code.value) == _STILL_ACTIVE
+    return {"creation": _filetime_int(created), "alive": alive}
+
+
+def pid_creation_filetime(pid: int) -> int | None:
+    """Creation time of whatever process currently owns ``pid``.
+
+    The temporary handle opened here is closed before this function returns.
+    """
+    if sys.platform != "win32" or isinstance(pid, bool) or not isinstance(pid, int) or pid <= 0:
+        return None
+    kernel32 = _kernel32()
+    handle = kernel32.OpenProcess(_PROCESS_QUERY, 0, int(pid))
+    if not handle:
+        return None
+    try:
+        status = handle_status(handle)
+    finally:
+        kernel32.CloseHandle(handle)
+    if not status:
+        return None
+    return int(status["creation"])
+
+
+def process_image_name(pid: int) -> str:
+    if sys.platform != "win32" or isinstance(pid, bool) or not isinstance(pid, int) or pid <= 0:
+        return ""
+    kernel32 = _kernel32()
+    handle = kernel32.OpenProcess(_PROCESS_QUERY, 0, int(pid))
+    if not handle:
+        return ""
+    try:
+        size = ctypes.c_uint(32768)
+        buffer = ctypes.create_unicode_buffer(size.value)
+        if not kernel32.QueryFullProcessImageNameW(handle, 0, buffer, ctypes.byref(size)):
+            return ""
+        return str(buffer.value)
+    finally:
+        kernel32.CloseHandle(handle)
+
+
+def terminate_process_handle(handle) -> bool:
+    """Stop the process behind a handle. This does not open a process id."""
+    if sys.platform != "win32" or not handle:
+        return False
+    return bool(_kernel32().TerminateProcess(handle, 1))
+
+
+def close_process_handle(handle) -> None:
+    if sys.platform != "win32" or not handle:
+        return
+    _kernel32().CloseHandle(handle)
+
+
+def _origin_image(pid: int, image: str) -> bool:
+    """True only when the live process image is Origin64.exe or Origin.exe.
+
+    ``image`` is the Restart Manager friendly name. That name is not an
+    executable path and is not accepted as proof.
+    """
+    del image
+    return Path(process_image_name(pid)).name.casefold() in _ORIGIN_IMAGES
+
+
+class _RM_UNIQUE_PROCESS(ctypes.Structure):
+    _fields_ = [
+        ("dwProcessId", ctypes.c_uint),
+        ("ProcessStartTime", _FILETIME),
+    ]
+
+
+class _RM_PROCESS_INFO(ctypes.Structure):
+    _fields_ = [
+        ("Process", _RM_UNIQUE_PROCESS),
+        ("strAppName", ctypes.c_wchar * 256),
+        ("strServiceShortName", ctypes.c_wchar * 64),
+        ("ApplicationType", ctypes.c_uint),
+        ("AppStatus", ctypes.c_uint),
+        ("TSSessionId", ctypes.c_uint),
+        ("bRestartable", ctypes.c_int),
+    ]
+
+
+_RM_LOCK = threading.Lock()
+_RSTRTMGR = None
+
+
+def _rstrtmgr():
+    """One private Restart Manager binding. Prototypes are set once."""
+    global _RSTRTMGR
+    with _RM_LOCK:
+        if _RSTRTMGR is None:
+            library = ctypes.WinDLL("rstrtmgr", use_last_error=True)
+            library.RmStartSession.argtypes = [ctypes.POINTER(ctypes.c_uint), ctypes.c_uint, ctypes.c_wchar_p]
+            library.RmStartSession.restype = ctypes.c_uint
+            library.RmRegisterResources.argtypes = [
+                ctypes.c_uint,
+                ctypes.c_uint,
+                ctypes.POINTER(ctypes.c_wchar_p),
+                ctypes.c_uint,
+                ctypes.c_void_p,
+                ctypes.c_uint,
+                ctypes.c_void_p,
+            ]
+            library.RmRegisterResources.restype = ctypes.c_uint
+            library.RmGetList.argtypes = [
+                ctypes.c_uint,
+                ctypes.POINTER(ctypes.c_uint),
+                ctypes.POINTER(ctypes.c_uint),
+                ctypes.c_void_p,
+                ctypes.POINTER(ctypes.c_uint),
+            ]
+            library.RmGetList.restype = ctypes.c_uint
+            library.RmEndSession.argtypes = [ctypes.c_uint]
+            library.RmEndSession.restype = ctypes.c_uint
+            _RSTRTMGR = library
+        return _RSTRTMGR
+
+
+def sentinel_holders(path: Path) -> list[dict[str, Any]]:
+    """Processes that have ``path`` open, according to the Restart Manager.
+
+    Each item is ``pid``, ``creation_filetime``, and ``image`` (the Restart
+    Manager application name, which is not an executable path and is not
+    proof by itself).
+    """
+    if sys.platform != "win32":
+        return []
+    library = _rstrtmgr()
+    session = ctypes.c_uint()
+    key = ctypes.create_unicode_buffer(33)
+    if library.RmStartSession(ctypes.byref(session), 0, key) != 0:
+        raise OSError(f"RmStartSession failed for {path}")
+    try:
+        files = (ctypes.c_wchar_p * 1)(str(path))
+        if library.RmRegisterResources(session, 1, files, 0, None, 0, None) != 0:
+            raise OSError(f"RmRegisterResources failed for {path}")
+        needed = ctypes.c_uint(0)
+        count = ctypes.c_uint(0)
+        reasons = ctypes.c_uint(0)
+        status = library.RmGetList(session, ctypes.byref(needed), ctypes.byref(count), None, ctypes.byref(reasons))
+        if status not in (0, 234):
+            raise OSError(f"RmGetList failed for {path}: {status}")
+        if needed.value == 0:
+            return []
+        array = (_RM_PROCESS_INFO * int(needed.value))()
+        count = ctypes.c_uint(array._length_)
+        status = library.RmGetList(
+            session, ctypes.byref(needed), ctypes.byref(count), ctypes.cast(array, ctypes.c_void_p), ctypes.byref(reasons),
+        )
+        if status == 234 and needed.value > array._length_:
+            array = (_RM_PROCESS_INFO * int(needed.value))()
+            count = ctypes.c_uint(array._length_)
+            status = library.RmGetList(
+                session,
+                ctypes.byref(needed),
+                ctypes.byref(count),
+                ctypes.cast(array, ctypes.c_void_p),
+                ctypes.byref(reasons),
+            )
+        if status != 0:
+            raise OSError(f"RmGetList failed for {path}: {status}")
+        holders = []
+        for index in range(int(count.value)):
+            item = array[index]
+            holders.append({
+                "pid": int(item.Process.dwProcessId),
+                "creation_filetime": _filetime_int(item.Process.ProcessStartTime),
+                "image": str(item.strAppName),
+            })
+        return holders
+    finally:
+        library.RmEndSession(session)
+
+
+def claim_sentinel_holder(holders: list[dict[str, Any]], *, is_origin_image) -> dict[str, Any] | None:
+    """Return the only process holding the sentinel when it is an Origin image.
+
+    Zero holders, more than one holder, or a holder that is not Origin yields
+    None. The caller must not turn that into a guess about other processes.
+    """
+    if len(holders) != 1:
+        return None
+    only = holders[0]
+    pid = only.get("pid")
+    creation = only.get("creation_filetime")
+    if isinstance(pid, bool) or not isinstance(pid, int) or pid <= 0:
+        return None
+    if isinstance(creation, bool) or not isinstance(creation, int) or creation <= 0:
+        return None
+    image = str(only.get("image") or "")
+    if not is_origin_image(pid, image):
+        return None
+    return {"pid": int(pid), "creation_filetime": int(creation), "image": image}
+
+
+def _same_path(reported: str, expected: Path) -> bool:
+    if not reported.strip():
+        return False
+    left = os.path.normcase(str(Path(reported).expanduser().resolve(strict=False)))
+    right = os.path.normcase(str(expected.expanduser().resolve(strict=False)))
+    return left == right
+
+
+def _hold_origin_sentinel(op, path: Path) -> None:
+    """Ask this COM instance to keep ``path`` open.
+
+    ``file.filename$``, ``file.mode`` and ``file.open()`` are the documented
+    LabTalk file object. The path is stored with ``set_lt_str`` so backslashes
+    are not parsed as LabTalk escapes. A rejected script, or a reported name
+    that is a different file, is not ownership. Restart Manager then has to
+    show that this file is held by exactly one Origin image.
+    """
+    target = str(path)
+    if not op.set_lt_str("file.filename$", target):
+        if not op.set_lt_str("__ORI_SENTINEL", target):
+            raise DataImportError(f"{_OWNERSHIP_ERROR} (could not store the sentinel path)")
+        if op.lt_exec("file.filename$=__ORI_SENTINEL$;") is False:
+            raise DataImportError(f"{_OWNERSHIP_ERROR} (could not copy the sentinel path)")
+    if op.lt_exec("file.mode=2; file.open();") is False:
+        raise DataImportError(f"{_OWNERSHIP_ERROR} (file.open was rejected)")
+    reported = str(op.get_lt_str("file.filename$") or "")
+    try:
+        held = int(op.lt_int("file.hFile") or 0)
+    except (TypeError, ValueError):
+        held = 0
+    if reported.strip() and not _same_path(reported, path):
+        raise DataImportError(
+            f"{_OWNERSHIP_ERROR} (file.filename$={reported!r}, file.hFile={held})"
+        )
+    if held <= 0 and not reported.strip():
+        raise DataImportError(f"{_OWNERSHIP_ERROR} (file.open left no filename or handle)")
+
+
+def _close_origin_sentinel(op) -> None:
+    try:
+        closer = getattr(op, "lt_exec", None)
+        if callable(closer):
+            closer("file.close();")
+    except Exception:
+        return
+
+
+class OwnedProcess:
+    """A process handle plus the creation time captured when it was proved."""
+
+    def __init__(self, pid: int, creation_filetime: int, handle: int, image: str) -> None:
+        self.pid = int(pid)
+        self.creation_filetime = int(creation_filetime)
+        self.handle = handle
+        self.image = image
+
+    def public(self) -> dict[str, Any]:
+        return {
+            "pid": self.pid,
+            "creation_filetime": self.creation_filetime,
+            "image": self.image,
+        }
+
+
 def validate_pdf_file(path: Path) -> dict[str, Any]:
-    """Require a PDF header, trailer, cross-reference, and at least one page object."""
+    """Require a PDF header, trailer, cross-reference, and an uncompressed page.
+
+    The page check is a byte search for an uncompressed ``/Type /Page``.
+    Object streams (``/ObjStm``) and page dictionaries that exist only inside
+    compressed streams are rejected. This checker does not decode them.
+    """
     data = Path(path).read_bytes()
     if len(data) < 32 or not data.startswith(b"%PDF-"):
         raise DataImportError(f"PDF header missing: {path}")
@@ -137,7 +479,13 @@ def validate_pdf_file(path: Path) -> dict[str, Any]:
         raise DataImportError(f"PDF cross-reference missing: {path}")
     pages = _PAGE_RE.findall(data)
     if not pages:
-        raise DataImportError(f"PDF has no page object: {path}")
+        if b"/ObjStm" in data:
+            raise DataImportError(
+                f"PDF stores page objects in an ObjStm; this checker only accepts an uncompressed /Type /Page: {path}"
+            )
+        raise DataImportError(
+            f"PDF has no uncompressed /Type /Page object; compressed page objects are not accepted: {path}"
+        )
     return {
         "size_bytes": len(data),
         "pages": len(pages),
@@ -196,6 +544,49 @@ def _save_graph_pdf(graph: Any, dest: Path, planned: PlannedTable) -> dict[str, 
     }
 
 
+def iter_project_sheets(books) -> list[Any]:
+    sheets = []
+    for book in books:
+        for sheet in book:
+            sheets.append(sheet)
+    return sheets
+
+
+def provenance_text(sheets) -> str:
+    chunks: list[str] = []
+    for sheet in sheets:
+        if str(getattr(sheet, "lname", "") or "") != "Import Provenance":
+            continue
+        cols = int(getattr(sheet, "cols", 0) or 0)
+        for index in range(cols):
+            chunks.extend(str(value) for value in sheet.to_list(index))
+    return "\n".join(chunks)
+
+
+def project_graph_for(sheets, graphs, expected: dict[str, Any]):
+    """Match one sheet and one graph. Ambiguous or missing identities raise."""
+    table = str(expected.get("table") or "")
+    title = str(expected.get("graph") or "")
+    short = str(expected.get("short_name") or "")
+    if not table or not title:
+        raise DataImportError("PDF recovery is missing the recorded table or graph name")
+    sheet_hits = [sheet for sheet in sheets if str(getattr(sheet, "lname", "") or "") == table]
+    graph_hits = []
+    for graph in graphs:
+        found_short, found_long = _graph_identity(graph)
+        if short and found_short != short:
+            continue
+        if found_long != title:
+            continue
+        graph_hits.append(graph)
+    if len(sheet_hits) != 1 or len(graph_hits) != 1:
+        raise DataImportError(
+            f"Refusing to export a PDF without a unique table/graph match for {table!r} / {title!r}"
+            + (f" / {short!r}" if short else "")
+        )
+    return sheet_hits[0], graph_hits[0]
+
+
 class OriginSession:
     """A single Origin instance created by this process."""
 
@@ -209,6 +600,7 @@ class OriginSession:
         self.starts = 0
         self.stops = 0
         self.owned_pids: set[int] = set()
+        self._owned: list[OwnedProcess] = []
         self.pending_cleanup: list[Path] = []
         self._before: set[int] = set()
         self._live = False
@@ -218,15 +610,27 @@ class OriginSession:
         self._timed_out = False
         self._stop_watchdog = threading.Event()
         self._watchdog: threading.Thread | None = None
+        self._pid_creation = pid_creation_filetime
+        self._handle_status = handle_status
+        self._terminate_handle = terminate_process_handle
+        self._close_handle = close_process_handle
+
+    @property
+    def owned_identities(self) -> list[dict[str, Any]]:
+        """Proved processes for this session, including ones already closed.
+
+        ``owned_pids`` is the same set of process ids. ``creation_filetime`` is
+        the creation time of the held handle. A later process that reuses the
+        id has a different creation time and is not this session.
+        """
+        return [item.public() for item in self._owned]
 
     def healthy(self) -> bool:
         if self._closed or not self.started or not self._alive or self.op is None:
             return False
         if not self._live:
             return True
-        if not self.owned_pids:
-            return False
-        return not self.owned_pids.isdisjoint(origin_pids())
+        return any(self._identity_ok(item) for item in self._owned)
 
     def start(self) -> None:
         if self.started and self.healthy():
@@ -253,37 +657,41 @@ class OriginSession:
         self.pending_cleanup = []
         self._closed = False
         self._stop_watchdog = threading.Event()
-        if self._live and self.timeout_s > 0:
-            self._watchdog = threading.Thread(
-                target=self._watch,
-                name="origin-session-watchdog",
-                daemon=True,
-            )
-            self._watchdog.start()
         launched = False
         try:
-            self._call(lambda: op.set_show(False))
+            op.set_show(False)
             launched = True
             if self._live:
-                self.owned_pids = self._await_owned_pids(sto)
-                if not self.owned_pids:
-                    raise sto.OriginExportError(
-                        "Origin did not start a process owned by this session"
-                    )
-            else:
-                self.owned_pids = set()
+                self._bind_owned_process(op)
+                if not self._owned:
+                    raise DataImportError(_OWNERSHIP_ERROR)
             self.started = True
             self._alive = True
             self.starts += 1
             OriginSession.launch_count += 1
+            if self._live and self.timeout_s > 0:
+                self._watchdog = threading.Thread(
+                    target=self._watch,
+                    name="origin-session-watchdog",
+                    daemon=True,
+                )
+                self._watchdog.start()
         except BaseException:
-            if launched or self.owned_pids:
+            self._stop_watchdog.set()
+            if self._owned:
                 self.started = True
                 self._alive = True
                 self.close()
             else:
-                self._stop_watchdog.set()
+                if launched and self.op is not None:
+                    try:
+                        sto.close_origin_app(self.op, started=True)
+                    except Exception:
+                        pass
+                self._release_handles()
                 self.op = None
+                self.started = False
+                self._alive = False
             raise
 
     def close(self) -> None:
@@ -296,39 +704,106 @@ class OriginSession:
             and threading.current_thread() is not self._watchdog
         ):
             self._watchdog.join(timeout=1)
-        if not self.started:
+        try:
+            if not self.started:
+                return
+            from . import exporter as ex
+
+            sto = ex._origin_support()
+            try:
+                if self.op is not None:
+                    sto.close_origin_app(self.op, started=True)
+            except Exception:
+                pass
+            if self._live:
+                self._wait_until_owned_exit()
+            sto._cleanup_origin_temp_dirs(self.pending_cleanup)
+            self.pending_cleanup = []
+            self.stops += 1
+            OriginSession.close_count += 1
+        finally:
+            self._release_handles()
+            self.started = False
+            self._alive = False
             self._closed = True
             self.op = None
-            return
-        from . import exporter as ex
-
-        sto = ex._origin_support()
-        try:
-            if self.op is not None:
-                sto.close_origin_app(self.op, started=True)
-        except Exception:
-            pass
-        if self._live:
-            self._wait_until_owned_exit()
-        sto._cleanup_origin_temp_dirs(self.pending_cleanup)
-        self.pending_cleanup = []
-        self.stops += 1
-        OriginSession.close_count += 1
-        self.started = False
-        self._alive = False
-        self._closed = True
-        self.op = None
 
     def terminate_owned(self) -> list[int]:
-        """Stop Origin processes that appeared after this session's baseline."""
-        current = origin_pids()
-        if self.owned_pids:
-            victims = sorted(pid for pid in self.owned_pids if pid in current and pid not in self._before)
-        else:
-            victims = sorted(current - set(self._before))
-        for pid in victims:
-            terminate_pid(pid)
-        return victims
+        """Stop proved processes whose handle and process id still match.
+
+        An empty ownership list stops nothing, even if a new Origin process
+        is visible. A reused process id is not terminated.
+        """
+        killed: list[int] = []
+        for owned in self._owned:
+            if not owned.handle or not self._identity_ok(owned):
+                continue
+            if self._terminate_handle(owned.handle):
+                killed.append(owned.pid)
+        return killed
+
+    def _identity_ok(self, owned: OwnedProcess) -> bool:
+        if not owned.handle:
+            return False
+        status = self._handle_status(owned.handle)
+        if not status or not status.get("alive"):
+            return False
+        if int(status.get("creation") or -1) != int(owned.creation_filetime):
+            return False
+        current = self._pid_creation(owned.pid)
+        if current is None or int(current) != int(owned.creation_filetime):
+            return False
+        return True
+
+    def _release_handles(self) -> None:
+        for owned in self._owned:
+            handle = owned.handle
+            owned.handle = None
+            if not handle:
+                continue
+            try:
+                self._close_handle(handle)
+            except Exception:
+                continue
+
+    def _bind_owned_process(self, op) -> None:
+        directory = Path(tempfile.mkdtemp(prefix="ori_owner_"))
+        sentinel = directory / "sentinel.bin"
+        sentinel.write_bytes(b"ori-owner")
+        try:
+            try:
+                _hold_origin_sentinel(op, sentinel)
+                holders = sentinel_holders(sentinel)
+            finally:
+                _close_origin_sentinel(op)
+            claimed = claim_sentinel_holder(holders, is_origin_image=_origin_image)
+            if claimed is None:
+                detail = []
+                for item in holders:
+                    pid = item.get("pid")
+                    image = process_image_name(pid) if isinstance(pid, int) and pid > 0 else ""
+                    detail.append(f"{pid}:{Path(image).name}")
+                raise DataImportError(f"{_OWNERSHIP_ERROR} (sentinel holders={detail})")
+            handle = _kernel32().OpenProcess(_PROCESS_QUERY | _PROCESS_TERMINATE, 0, int(claimed["pid"]))
+            if not handle:
+                raise DataImportError(_OWNERSHIP_ERROR)
+            status = handle_status(handle)
+            if (
+                not status
+                or not status.get("alive")
+                or int(status["creation"]) != int(claimed["creation_filetime"])
+            ):
+                close_process_handle(handle)
+                raise DataImportError(_OWNERSHIP_ERROR)
+            image = process_image_name(claimed["pid"]) or str(claimed.get("image") or "")
+            if Path(image).name.casefold() not in _ORIGIN_IMAGES:
+                close_process_handle(handle)
+                raise DataImportError(_OWNERSHIP_ERROR)
+            owned = OwnedProcess(int(claimed["pid"]), int(claimed["creation_filetime"]), handle, image)
+            self._owned.append(owned)
+            self.owned_pids.add(owned.pid)
+        finally:
+            shutil.rmtree(directory, ignore_errors=True)
 
     def write_project(
         self,
@@ -404,29 +879,95 @@ class OriginSession:
             graph = graphs[graph_index]
             graph_index += 1
             dest = stage_dir / f"graph_{graph_index:02d}.pdf"
+            short_name, long_name = _graph_identity(graph)
+            identity = {
+                "table": planned.name,
+                "graph": long_name or planned.plot.title or planned.name,
+                "short_name": short_name,
+            }
             try:
                 info = self._call(lambda graph=graph, dest=dest, planned=planned: _save_graph_pdf(graph, dest, planned))
                 results.append({"ok": True, "staged": dest, **info})
             except OriginSessionLost:
                 results.append({
                     "ok": False,
-                    "table": planned.name,
-                    "graph": planned.plot.title or planned.name,
                     "staged": None,
                     "pages": 0,
                     "error": "Origin session was lost while exporting this PDF",
+                    **identity,
                 })
                 raise
             except Exception as exc:
                 results.append({
                     "ok": False,
-                    "table": planned.name,
-                    "graph": planned.plot.title or planned.name,
                     "staged": None,
                     "pages": 0,
                     "error": str(exc) or exc.__class__.__name__,
+                    **identity,
                 })
         return results
+
+    def export_saved_pdfs(self, project: Path, graphs: list[dict[str, Any]]) -> list[dict[str, Any]]:
+        """Open a saved project and export only the requested graphs.
+
+        The project is opened read-only. This method does not save it. Each
+        graph must match one sheet long name and one graph identity. A missing
+        or ambiguous match is an error for that graph and does not export a
+        different graph.
+        """
+        if not self.healthy():
+            raise OriginSessionLost("Origin session is not running")
+        project = Path(project)
+        before_bytes = project.read_bytes()
+        before = hashlib.sha256(before_bytes).hexdigest()
+
+        def work() -> list[dict[str, Any]]:
+            opened = self.op.open(str(project), True, False)
+            if opened is False:
+                raise DataImportError(f"Origin did not open the saved project: {project}")
+            books = list(self.op.pages("w"))
+            sheets = iter_project_sheets(books)
+            source_name = str((graphs[0] if graphs else {}).get("source_name") or "")
+            if not source_name or source_name not in provenance_text(sheets):
+                raise DataImportError(
+                    f"Saved project provenance does not match {source_name or 'the recorded source'}: {project}"
+                )
+            pages = list(self.op.pages("g"))
+            exported: list[dict[str, Any]] = []
+            for item in graphs:
+                try:
+                    _sheet, graph = project_graph_for(sheets, pages, item)
+                    dest = Path(item["dest"])
+                    info = _save_graph_pdf(
+                        graph,
+                        dest,
+                        SimpleNamespace(
+                            name=str(item.get("table") or ""),
+                            plot=SimpleNamespace(title=str(item.get("graph") or ""), kind="line"),
+                        ),
+                    )
+                    exported.append({"ok": True, "staged": dest, **info})
+                except OriginSessionLost:
+                    raise
+                except Exception as exc:
+                    exported.append({
+                        "ok": False,
+                        "staged": None,
+                        "pages": 0,
+                        "table": str(item.get("table") or ""),
+                        "graph": str(item.get("graph") or ""),
+                        "short_name": str(item.get("short_name") or ""),
+                        "error": str(exc) or exc.__class__.__name__,
+                    })
+            return exported
+
+        try:
+            exported = self._call(work)
+        except Exception:
+            _guard_saved_project(project, before_bytes, before)
+            raise
+        _guard_saved_project(project, before_bytes, before)
+        return exported
 
     def _call(self, fn):
         if not self._live or self.timeout_s <= 0:
@@ -446,33 +987,59 @@ class OriginSession:
 
     def _watch(self) -> None:
         while not self._stop_watchdog.wait(0.2):
-            deadline = self._deadline
-            if deadline is not None and time.monotonic() >= deadline:
-                self.terminate_owned()
-                self._timed_out = True
-                self._alive = False
-                self._deadline = None
+            self._enforce_deadline()
 
-    def _await_owned_pids(self, sto) -> set[int]:
-        limit = self.timeout_s if self.timeout_s > 0 else 60.0
-        deadline = time.monotonic() + min(limit, 60.0)
-        while True:
-            current = origin_pids()
-            owned = current - set(self._before)
-            if owned:
-                return owned
-            if current & set(self._before):
-                raise sto.OriginExportError(
-                    "Origin attached to a process that was already running; the existing session was left untouched"
-                )
-            if time.monotonic() >= deadline:
-                return set()
-            time.sleep(0.2)
+    def _enforce_deadline(self) -> None:
+        deadline = self._deadline
+        if deadline is None or time.monotonic() < deadline:
+            return
+        self.terminate_owned()
+        self._timed_out = True
+        self._alive = False
+        self._deadline = None
 
     def _wait_until_owned_exit(self) -> None:
         deadline = time.monotonic() + 8.0
         while time.monotonic() < deadline:
-            if self.owned_pids.isdisjoint(origin_pids()):
+            if not any(self._identity_ok(item) for item in self._owned):
                 return
             time.sleep(0.2)
         self.terminate_owned()
+
+
+def _sha256_bytes(path: Path) -> str:
+    digest = hashlib.sha256()
+    with Path(path).open("rb") as stream:
+        for block in iter(lambda: stream.read(1024 * 1024), b""):
+            digest.update(block)
+    return digest.hexdigest()
+
+
+def _restore_exact(path: Path, payload: bytes) -> bool:
+    temporary = path.with_name(path.name + ".restore-tmp")
+    try:
+        temporary.write_bytes(payload)
+        os.replace(temporary, path)
+        return _sha256_bytes(path) == hashlib.sha256(payload).hexdigest()
+    except OSError:
+        return False
+    finally:
+        if temporary.exists():
+            temporary.unlink(missing_ok=True)
+
+
+def _guard_saved_project(project: Path, before_bytes: bytes, before_hash: str) -> None:
+    """Restore ``project`` when a PDF-only open changed its bytes."""
+    try:
+        after = _sha256_bytes(project)
+    except OSError as exc:
+        raise DataImportError(f"PDF recovery could not re-read the saved project: {project}") from exc
+    if after == before_hash:
+        return
+    if _restore_exact(project, before_bytes):
+        raise DataImportError(
+            f"PDF recovery changed the saved project; the original bytes were restored: {project}"
+        )
+    raise DataImportError(
+        f"PDF recovery changed the saved project and the original bytes could not be restored: {project}"
+    )

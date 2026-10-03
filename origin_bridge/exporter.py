@@ -934,7 +934,8 @@ class origin_export_lock:
     def __enter__(self):
         depth = getattr(_export_local, "depth", 0)
         if depth == 0:
-            _export_gate.acquire()
+            if not _export_gate.acquire(blocking=False):
+                raise _origin_error_type()("Another generic Origin export is already active")
             lock = _origin_export_lock()
             try:
                 lock.__enter__()

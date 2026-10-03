@@ -133,6 +133,7 @@ def build_batch_request(
     for index, item in enumerate(request["task_overrides"]):
         if "plot" in item:
             _validate_plot_request(item["plot"], f"task_overrides[{index}].plot", partial=True)
+    _reject_unsupported_modes(request)
     json.dumps(request, ensure_ascii=False)
     return request
 
@@ -151,6 +152,7 @@ def execute_batch(
     job = _checked_request(request)
     if resume is not None:
         job["resume"] = bool(resume)
+    _reject_unsupported_modes(job)
     with origin_export_lock():
         if job["layout"] == "unified":
             return _execute_unified(job, progress=progress, cancel_event=cancel_event)
@@ -300,8 +302,8 @@ def _execute_per_file(
     output_dir = Path(job["output_dir"])
     output_dir.mkdir(parents=True, exist_ok=True)
     record_path = Path(job["record_path"])
-    record, record_warning = _open_record(record_path, resume=job["resume"], retry_ids=job["retry_task_ids"])
     tasks, excluded = _discover_tasks(job)
+    record, record_warning = _open_record(record_path, resume=job["resume"], retry_ids=job["retry_task_ids"])
     resident = _Resident(int(job["max_resident_tasks"]))
     warnings = list(excluded)
     if record_warning:
@@ -311,6 +313,7 @@ def _execute_per_file(
         "origin_starts": 0,
         "origin_stops": 0,
         "owned_pids": [],
+        "owned_processes": [],
         "recycled": 0,
         "cancelled": False,
     }
@@ -327,7 +330,7 @@ def _execute_per_file(
             look += 1
             if ahead["task_id"] in resident.items:
                 continue
-            if ahead["task_id"] != tasks[index]["task_id"] and _skip_decision(record, ahead, job) is None:
+            if ahead["task_id"] != tasks[index]["task_id"] and _task_decision(record, ahead, job)["kind"] != "run":
                 continue
             try:
                 loaded = _load_tables(Path(ahead["source"]), ahead["read_options"])
@@ -356,10 +359,8 @@ def _execute_per_file(
                 _finish_task(record, record_path, results, state, task, index, len(tasks), progress, warnings,
                              status="cancelled", error=_error("Cancelled", "cancelled before this task started"))
                 continue
-            if task["status_hint"] == "skipped_excluded":
-                continue
-            decision = _skip_decision(record, task, job)
-            if decision is None:
+            decision = _task_decision(record, task, job)
+            if decision["kind"] == "skip":
                 _finish_task(
                     record, record_path, results, state, task, index, len(tasks), progress, warnings,
                     status="skipped",
@@ -368,29 +369,49 @@ def _execute_per_file(
                     pdf_status=_stored_pdf_status(record, task["task_id"], job["pdf"]),
                 )
                 continue
+            if decision["kind"] == "block":
+                _report_preserved_block(
+                    record_path, results, state, task, index, len(tasks), progress, warnings,
+                    decision["reason"],
+                )
+                continue
             prefetch_through(index)
-            outcome = _run_one(
-                job,
-                task,
-                resident,
-                state,
-                session,
-                session_factory,
-                since_start,
-            )
+            if decision["kind"] == "recover":
+                outcome = _recover_one(
+                    job, task, decision, state, session, session_factory, since_start,
+                )
+            else:
+                outcome = _run_one(
+                    job,
+                    task,
+                    resident,
+                    state,
+                    session,
+                    session_factory,
+                    since_start,
+                )
             session = outcome["session"]
             since_start = outcome["since_start"]
-            _finish_task(
-                record, record_path, results, state, task, index, len(tasks), progress, warnings,
-                status=outcome["status"],
-                error=outcome.get("error"),
-                output=outcome.get("output"),
-                pdfs=outcome.get("pdfs") or [],
-                pdf_status=outcome.get("pdf_status", "not_applicable"),
-                source_sha256=outcome.get("source_sha256"),
-                warnings_for_task=outcome.get("warnings") or [],
-                resolved_plot=outcome.get("resolved_plot"),
-            )
+            if outcome.get("preserve_record"):
+                _report_preserved_block(
+                    record_path, results, state, task, index, len(tasks), progress, warnings,
+                    (outcome.get("error") or {}).get("message") or "PDF recovery was refused",
+                    pdf_errors=outcome.get("pdf_errors") or [],
+                )
+            else:
+                _finish_task(
+                    record, record_path, results, state, task, index, len(tasks), progress, warnings,
+                    status=outcome["status"],
+                    error=outcome.get("error"),
+                    output=outcome.get("output"),
+                    pdfs=outcome.get("pdfs") or [],
+                    pdf_status=outcome.get("pdf_status", "not_applicable"),
+                    source_sha256=outcome.get("source_sha256"),
+                    warnings_for_task=outcome.get("warnings") or [],
+                    resolved_plot=outcome.get("resolved_plot"),
+                    pdf_errors=outcome.get("pdf_errors") or [],
+                    graph_identities=outcome.get("graph_identities") or [],
+                )
             if outcome.get("recycle"):
                 close_session()
                 since_start = 0
@@ -471,7 +492,7 @@ def _run_one(job, task, resident: _Resident, state, session, session_factory, si
                     state["origin_starts"] += int(getattr(session, "starts", 0)) - before_starts
                     return _failed(exc, session, since_start, source_hash)
                 state["origin_starts"] += int(getattr(session, "starts", 0)) - before_starts
-                state["owned_pids"] = sorted(int(pid) for pid in getattr(session, "owned_pids", []) or [])
+                _remember_owned(state, session)
                 since_start = 0
             from .exporter import _all_warnings, _install_staged_file, _validate_prepared
 
@@ -508,9 +529,10 @@ def _run_one(job, task, resident: _Resident, state, session, session_factory, si
                     _install_staged_file(staged, output, overwrite=bool(job["overwrite"]))
                 except FileExistsError as exc:
                     return _blocked(exc, session, since_start, source_hash, resolved)
-                pdfs, pdf_status = _install_pdfs(
+                pdfs, pdf_status, pdf_errors = _install_pdfs(
                     output, written.get("pdfs") or [], job, graph_count,
                 )
+                identities = _graph_identities(written.get("pdfs") or [])
                 since_start += 1
                 recycle = bool(job["recycle_every"]) and since_start >= int(job["recycle_every"])
                 if written.get("session_lost"):
@@ -533,6 +555,8 @@ def _run_one(job, task, resident: _Resident, state, session, session_factory, si
                     },
                     "pdfs": pdfs,
                     "pdf_status": pdf_status,
+                    "pdf_errors": pdf_errors,
+                    "graph_identities": identities,
                     "source_sha256": source_hash,
                     "warnings": _all_warnings(prepared, prepared.tables, conversion_warnings),
                     "resolved_plot": resolved,
@@ -551,14 +575,15 @@ def _install_pdfs(opju: Path, raw_pdfs: list[dict[str, Any]], job: Mapping[str, 
     from .session import validate_pdf_file
 
     if not job["pdf"] or graph_count == 0:
-        return [], "not_applicable"
+        return [], "not_applicable", []
     installed = []
     errors = []
     for index, item in enumerate(raw_pdfs, start=1):
+        slot = int(item.get("index") or index)
+        final = _pdf_target(opju, slot, str(item.get("table") or item.get("graph") or "graph"))
         if not item.get("ok") or not item.get("staged"):
-            errors.append(str(item.get("error") or "PDF export failed"))
+            errors.append(_pdf_error(item, final, str(item.get("error") or "PDF export failed")))
             continue
-        final = _pdf_target(opju, index, str(item.get("table") or item.get("graph") or "graph"))
         try:
             info = validate_pdf_file(Path(item["staged"]))
             _install_staged_file(Path(item["staged"]), final, overwrite=bool(job["overwrite"]))
@@ -570,13 +595,37 @@ def _install_pdfs(opju: Path, raw_pdfs: list[dict[str, Any]], job: Mapping[str, 
                 "pages": checked["pages"],
                 "graph": item.get("graph") or "",
                 "table": item.get("table") or "",
+                "short_name": item.get("short_name") or "",
+                "index": slot,
                 "header": info["header"],
             })
         except Exception as exc:
-            errors.append(str(exc) or exc.__class__.__name__)
+            errors.append(_pdf_error(item, final, str(exc) or exc.__class__.__name__))
     if errors or len(installed) != graph_count:
-        return installed, "failed"
-    return installed, "ok"
+        return installed, "failed", errors
+    return installed, "ok", []
+
+
+def _pdf_error(item: Mapping[str, Any], path: Path, message: str) -> dict[str, Any]:
+    return {
+        "table": str(item.get("table") or ""),
+        "graph": str(item.get("graph") or ""),
+        "short_name": str(item.get("short_name") or ""),
+        "path": str(path),
+        "message": message,
+    }
+
+
+def _graph_identities(raw_pdfs: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    identities = []
+    for index, item in enumerate(raw_pdfs, start=1):
+        identities.append({
+            "index": int(item.get("index") or index),
+            "table": str(item.get("table") or ""),
+            "graph": str(item.get("graph") or ""),
+            "short_name": str(item.get("short_name") or ""),
+        })
+    return identities
 
 
 def _execute_unified(job, *, progress, cancel_event) -> dict[str, Any]:
@@ -590,11 +639,11 @@ def _execute_unified(job, *, progress, cancel_event) -> dict[str, Any]:
     record_path = Path(job["record_path"])
     output_dir = Path(job["output_dir"])
     output_dir.mkdir(parents=True, exist_ok=True)
+    paths, excluded = _input_paths(job)
+    warnings.extend(excluded)
     record, record_warning = _open_record(record_path, resume=job["resume"], retry_ids=job["retry_task_ids"])
     if record_warning:
         warnings.append(record_warning)
-    paths, excluded = _input_paths(job)
-    warnings.extend(excluded)
     output = output_dir / _with_suffix(str(job["output_name"]), job["format"])
     task = {
         "task_id": "unified",
@@ -610,6 +659,7 @@ def _execute_unified(job, *, progress, cancel_event) -> dict[str, Any]:
         "origin_starts": 0,
         "origin_stops": 0,
         "owned_pids": [],
+        "owned_processes": [],
         "recycled": 0,
         "cancelled": False,
     }
@@ -652,14 +702,6 @@ def _execute_unified(job, *, progress, cancel_event) -> dict[str, Any]:
             source_sha256=_combined_source_hash(paths),
             warnings_for_task=list(receipt.get("warnings") or []),
         )
-        # Unified skip identity is the combined source hash stored above.
-        if results:
-            results[-1]["sources"] = [str(path) for path in paths]
-            record_task = record["tasks"].get("unified")
-            if isinstance(record_task, dict):
-                record_task["sources"] = [str(path) for path in paths]
-                record_task["source_sha256"] = _combined_source_hash(paths)
-                save_batch_record(record_path, record)
     state["origin_starts"] = OriginSession.launch_count - launches_before
     state["origin_stops"] = OriginSession.close_count - closes_before
     return _result(job, results, state, warnings, len(paths))
@@ -699,7 +741,6 @@ def _discover_tasks(job: dict[str, Any]) -> tuple[list[dict[str, Any]], list[str
             "read_options": read_options,
             "plot": plot,
             "pdf_requested": bool(job["pdf"]),
-            "status_hint": "",
         })
     return tasks, notes
 
@@ -708,6 +749,7 @@ def _input_paths(job: dict[str, Any]) -> tuple[list[Path], list[str]]:
     from .readers import discover_files
 
     raw_inputs = [Path(item) for item in job["inputs"]]
+    explicit_files = {path.resolve() for path in raw_inputs if path.exists() and path.is_file()}
     discovered = discover_files(raw_inputs)
     output_dir = Path(job["output_dir"]).resolve()
     record_path = Path(job["record_path"]).resolve()
@@ -726,6 +768,7 @@ def _input_paths(job: dict[str, Any]) -> tuple[list[Path], list[str]]:
             record_path=record_path,
             log_path=log_path,
             unified_output=unified_output,
+            explicit=resolved in explicit_files,
         )
         if reason:
             notes.append(f"excluded {resolved}: {reason}")
@@ -744,12 +787,13 @@ def _exclusion_reason(
     record_path: Path,
     log_path: Path,
     unified_output: Path,
+    explicit: bool = False,
 ) -> str | None:
     if path == record_path or path == log_path or path == Path(str(record_path) + ".bak"):
         return "batch record or log"
     if path.name.endswith(".previous") and path.stem == record_path.name:
         return "archived batch record"
-    if _GENERATED_NAME.search(path.name):
+    if _GENERATED_NAME.search(path.name) and not explicit:
         return "generated batch output name"
     if path == unified_output:
         return "unified output path"
@@ -856,55 +900,392 @@ def _load_tables(path: Path, options: Mapping[str, Any]) -> tuple[list[DataTable
     return list(tables), digest
 
 
-def _skip_decision(record: Mapping[str, Any], task: Mapping[str, Any], job: Mapping[str, Any]) -> str | None:
-    """Return a reason to run the task, or None when the recorded success is still valid."""
+def _task_decision(record: Mapping[str, Any], task: Mapping[str, Any], job: Mapping[str, Any]) -> dict[str, Any]:
+    """Choose skip, recover, block, or a full run for one recorded task."""
     stored = (record.get("tasks") or {}).get(task["task_id"])
+    run = {"kind": "run", "reason": "no record", "keep_pdfs": [], "export": [], "stored": None}
     if not isinstance(stored, dict):
-        return "no record"
+        return run
     if stored.get("status") != "succeeded":
-        return f"recorded status is {stored.get('status')}"
+        return {**run, "reason": f"recorded status is {stored.get('status')}", "stored": stored}
     source = Path(task["source"])
     if not source.is_file():
-        return "source missing"
+        return {**run, "reason": "source missing", "stored": stored}
     try:
         current_hash = _sha256_file(source)
     except OSError as exc:
-        return f"source unreadable: {exc}"
+        return {**run, "reason": f"source unreadable: {exc}", "stored": stored}
     if current_hash != stored.get("source_sha256"):
-        return "source bytes changed"
+        return {**run, "reason": "source bytes changed", "stored": stored}
     if _canonical(stored.get("read_options")) != _canonical(task["read_options"]):
-        return "read options changed"
+        return {**run, "reason": "read options changed", "stored": stored}
     if _canonical(stored.get("plot")) != _canonical(task["plot"]):
-        return "plot config changed"
+        return {**run, "reason": "plot config changed", "stored": stored}
     if stored.get("format") != job["format"] or bool(stored.get("pdf")) != bool(job["pdf"]):
-        return "output format or pdf setting changed"
+        return {**run, "reason": "output format or pdf setting changed", "stored": stored}
     fingerprint = _fingerprint(current_hash, task["read_options"], task["plot"], job["format"], job["pdf"], task["output"])
     if stored.get("fingerprint") != fingerprint:
-        return "task fingerprint changed"
+        return {**run, "reason": "task fingerprint changed", "stored": stored}
     output = stored.get("output") or {}
     if str(output.get("path") or "") != str(task["output"]):
-        return "output path changed"
+        return {**run, "reason": "output path changed", "stored": stored}
     target = Path(str(output.get("path") or ""))
     if not target.is_file() or target.stat().st_size <= 0:
-        return "output missing or empty"
+        return {**run, "reason": "output missing or empty", "stored": stored}
     if _sha256_file(target) != output.get("sha256"):
-        return "output bytes changed"
-    if job["pdf"] and stored.get("pdf_status") == "ok":
-        for item in stored.get("pdfs") or []:
-            pdf_path = Path(str(item.get("path") or ""))
-            if not pdf_path.is_file() or pdf_path.stat().st_size <= 0:
-                return "pdf missing or empty"
-            if _sha256_file(pdf_path) != item.get("sha256"):
-                return "pdf bytes changed"
-            try:
-                from .session import validate_pdf_file
+        return {**run, "reason": "output bytes changed", "stored": stored}
+    if not job["pdf"] or stored.get("pdf_status") == "not_applicable":
+        return {"kind": "skip", "reason": "", "keep_pdfs": [], "export": [], "stored": stored}
+    return _pdf_recovery_plan(stored, job, target)
 
-                validate_pdf_file(pdf_path)
-            except Exception as exc:
-                return f"pdf is no longer valid: {exc}"
-    elif job["pdf"] and stored.get("pdf_status") == "failed":
-        return "previous pdf export failed"
+
+def _pdf_recovery_plan(stored: Mapping[str, Any], job: Mapping[str, Any], opju: Path) -> dict[str, Any]:
+    from .session import validate_pdf_file
+
+    expected = _expected_graphs(stored)
+    if not expected:
+        return _preserved_block(stored, "PDF recovery needs recorded graph identities and this record has none")
+    recorded = [item for item in (stored.get("pdfs") or []) if isinstance(item, dict)]
+    keep: list[dict[str, Any]] = []
+    export: list[dict[str, Any]] = []
+    for graph in expected:
+        final = _pdf_target(opju, int(graph["index"]), graph["table"])
+        receipt = _receipt_for(recorded, final, graph)
+        if final.is_file() and final.stat().st_size > 0:
+            digest = _sha256_file(final)
+            try:
+                validate_pdf_file(final)
+                valid = True
+            except Exception:
+                valid = False
+            if receipt and receipt.get("sha256") == digest and valid:
+                keep.append(_kept_pdf(receipt, graph))
+                continue
+            if job["overwrite"]:
+                export.append({**graph, "path": str(final)})
+                continue
+            if receipt:
+                return _preserved_block(stored, f"pdf bytes changed: {final}")
+            return _preserved_block(stored, f"unexpected pdf at {final}; refusing to replace it without overwrite")
+        export.append({**graph, "path": str(final)})
+    if not export:
+        return {"kind": "skip", "reason": "", "keep_pdfs": keep, "export": [], "stored": stored}
+    return {"kind": "recover", "reason": "pdf recovery", "keep_pdfs": keep, "export": export, "stored": stored}
+
+
+def _preserved_block(stored: Mapping[str, Any], reason: str) -> dict[str, Any]:
+    return {"kind": "block", "reason": reason, "keep_pdfs": [], "export": [], "stored": stored}
+
+
+def _expected_graphs(stored: Mapping[str, Any]) -> list[dict[str, Any]]:
+    identities = stored.get("graph_identities")
+    if isinstance(identities, list) and identities:
+        graphs = []
+        for index, item in enumerate(identities, start=1):
+            if not isinstance(item, dict):
+                continue
+            graphs.append({
+                "index": int(item.get("index") or index),
+                "table": str(item.get("table") or ""),
+                "graph": str(item.get("graph") or ""),
+                "short_name": str(item.get("short_name") or ""),
+            })
+        return [item for item in graphs if item["table"] and item["graph"]]
+    graphs = []
+    index = 0
+    for item in stored.get("resolved_plot") or []:
+        if not isinstance(item, dict) or item.get("kind") == "none":
+            continue
+        index += 1
+        graphs.append({
+            "index": index,
+            "table": str(item.get("table") or ""),
+            "graph": str(item.get("title") or item.get("table") or ""),
+            "short_name": "",
+        })
+    return [item for item in graphs if item["table"] and item["graph"]]
+
+
+def _receipt_for(recorded: list[dict[str, Any]], final: Path, graph: Mapping[str, Any]) -> dict[str, Any] | None:
+    final_key = os.path.normcase(str(final))
+    for item in recorded:
+        if os.path.normcase(str(item.get("path") or "")) == final_key:
+            return item
+    matches = [
+        item for item in recorded
+        if str(item.get("table") or "") == graph["table"] and str(item.get("graph") or "") == graph["graph"]
+    ]
+    if len(matches) == 1:
+        return matches[0]
     return None
+
+
+def _kept_pdf(receipt: Mapping[str, Any], graph: Mapping[str, Any]) -> dict[str, Any]:
+    kept = dict(receipt)
+    kept["index"] = int(graph["index"])
+    kept["table"] = graph["table"]
+    kept["graph"] = graph["graph"]
+    kept["short_name"] = str(graph.get("short_name") or receipt.get("short_name") or "")
+    return kept
+
+
+def _reject_unsupported_modes(job: Mapping[str, Any]) -> None:
+    """Reject combinations that would ignore an explicit request."""
+    if job.get("layout") == "unified" and job.get("pdf"):
+        raise DataImportError(
+            "unified layout cannot export PDFs; it is the legacy single-project path. Use layout 'per_file'."
+        )
+    if job.get("layout") == "unified" and (job.get("resume") or job.get("retry_task_ids")):
+        raise DataImportError(
+            "unified layout does not support resume or retry; it would re-export the whole project "
+            "without skip semantics. Use layout 'per_file'."
+        )
+    if job.get("retry_task_ids") and not job.get("resume"):
+        raise DataImportError(
+            "retry_task_ids requires resume=True; passing it with resume=False is rejected instead of ignored"
+        )
+
+
+def _remember_owned(state: dict[str, Any], session: Any) -> None:
+    """Record every proved process, not only the latest session.
+
+    ``owned_pids`` is the sorted set of those process ids. ``owned_processes``
+    keeps the creation time and image when the session proved them. A later
+    process that reuses an id has a different creation time and is a different
+    entry. Fake sessions that only expose process ids are stored as pid-only
+    entries. This is the history of processes this batch proved, not every
+    Origin process that happened to appear.
+    """
+    identities = list(getattr(session, "owned_identities", None) or [])
+    if not identities:
+        for pid in getattr(session, "owned_pids", []) or []:
+            identities.append({"pid": int(pid)})
+    seen = {(item.get("pid"), item.get("creation_filetime")) for item in state["owned_processes"]}
+    for item in identities:
+        copied = dict(item)
+        key = (copied.get("pid"), copied.get("creation_filetime"))
+        if key in seen:
+            continue
+        state["owned_processes"].append(copied)
+        seen.add(key)
+    state["owned_pids"] = sorted({
+        int(item["pid"]) for item in state["owned_processes"] if item.get("pid") is not None
+    })
+
+
+def _report_preserved_block(
+    record_path, results, state, task, index, count, progress, warnings, reason, pdf_errors=None,
+) -> None:
+    """Report a block without replacing the stored success receipt."""
+    error = _error("DataImportError", reason)
+    results.append({
+        "task_id": task["task_id"],
+        "source": task.get("source"),
+        "sources": list(task.get("sources") or ([task["source"]] if task.get("source") else [])),
+        "status": "blocked",
+        "output": None,
+        "pdfs": [],
+        "pdf_status": "not_applicable",
+        "pdf_errors": list(pdf_errors or []),
+        "error": error,
+        "warnings": [],
+        "resolved_plot": None,
+    })
+    state["counts"]["blocked"] = state["counts"].get("blocked", 0) + 1
+    _emit(record_path, progress, warnings, {
+        "type": "task",
+        "task_id": task["task_id"],
+        "index": index,
+        "count": count,
+        "status": "blocked",
+        "source": task.get("source"),
+        "output": task.get("output"),
+        "error": error,
+        "pdf_status": "not_applicable",
+        "pdf_errors": list(pdf_errors or []),
+    })
+
+
+def _restore_exact(path: Path, payload: bytes) -> bool:
+    temporary = path.with_name(path.name + ".restore-tmp")
+    try:
+        temporary.write_bytes(payload)
+        os.replace(temporary, path)
+        return hashlib.sha256(path.read_bytes()).hexdigest() == hashlib.sha256(payload).hexdigest()
+    except OSError:
+        return False
+    finally:
+        if temporary.exists():
+            temporary.unlink(missing_ok=True)
+
+
+def _pdf_failed_keep(session, since_start, stored, decision, source_hash, message: str) -> dict[str, Any]:
+    export = decision.get("export") or []
+    target = Path(export[0]["path"]) if export else Path(str((stored.get("output") or {}).get("path") or ""))
+    return {
+        "status": "succeeded",
+        "session": session,
+        "since_start": since_start,
+        "recycle": False,
+        "output": stored.get("output"),
+        "pdfs": list(decision.get("keep_pdfs") or []),
+        "pdf_status": "failed",
+        "pdf_errors": [_pdf_error(
+            {"table": "", "graph": "", "short_name": ""},
+            target,
+            message,
+        )],
+        "source_sha256": source_hash,
+        "warnings": [],
+        "resolved_plot": stored.get("resolved_plot"),
+        "graph_identities": list(stored.get("graph_identities") or []),
+        "error": None,
+    }
+
+
+def _preserve_outcome(session, since_start, reason: str) -> dict[str, Any]:
+    return {
+        "preserve_record": True,
+        "status": "blocked",
+        "session": session,
+        "since_start": since_start,
+        "recycle": False,
+        "error": _error("DataImportError", reason),
+        "pdf_errors": [],
+    }
+
+
+def _recover_one(job, task, decision, state, session, session_factory, since_start) -> dict[str, Any]:
+    """Export missing PDFs from the saved project without rewriting that project."""
+    from .exporter import _install_staged_file
+    from .session import validate_pdf_file
+
+    stored = decision.get("stored") or {}
+    output = Path(task["output"])
+    source = Path(task["source"])
+    try:
+        source_hash = _sha256_file(source)
+        snapshot = output.read_bytes()
+    except OSError as exc:
+        return _preserve_outcome(session, since_start, f"PDF recovery could not read source or project: {exc}")
+    opju_hash = hashlib.sha256(snapshot).hexdigest()
+    if source_hash != stored.get("source_sha256") or opju_hash != (stored.get("output") or {}).get("sha256"):
+        return _preserve_outcome(session, since_start, "source or project bytes changed before PDF recovery")
+    started_new = False
+    if session is None or not session.healthy():
+        if session is not None:
+            before_stops = int(getattr(session, "stops", 0))
+            try:
+                session.close()
+            finally:
+                state["origin_stops"] += int(getattr(session, "stops", 0)) - before_stops
+        session = _make_session(job, session_factory)
+        before_starts = int(getattr(session, "starts", 0))
+        try:
+            session.start()
+        except Exception as exc:
+            state["origin_starts"] += int(getattr(session, "starts", 0)) - before_starts
+            return _pdf_failed_keep(session, since_start, stored, decision, source_hash, str(exc) or exc.__class__.__name__)
+        state["origin_starts"] += int(getattr(session, "starts", 0)) - before_starts
+        _remember_owned(state, session)
+        started_new = True
+    if started_new:
+        since_start = 0
+    stage_dir = Path(tempfile.mkdtemp(prefix=f".{output.stem}_pdf_", dir=str(output.parent)))
+    try:
+        graphs = []
+        for item in decision.get("export") or []:
+            dest = stage_dir / f"recover_{int(item['index']):02d}.pdf"
+            graphs.append({
+                "index": int(item["index"]),
+                "table": item["table"],
+                "graph": item["graph"],
+                "short_name": item.get("short_name") or "",
+                "source_name": str(source.resolve()),
+                "dest": str(dest),
+                "final": item["path"],
+            })
+        try:
+            written = list(session.export_saved_pdfs(output, graphs))
+        except Exception as exc:
+            try:
+                current = hashlib.sha256(output.read_bytes()).hexdigest()
+            except OSError:
+                return _preserve_outcome(
+                    session, since_start, f"PDF recovery could not re-read the saved project: {exc}",
+                )
+            if current != opju_hash and not _restore_exact(output, snapshot):
+                return _preserve_outcome(
+                    session, since_start, f"PDF recovery changed the saved project and it could not be restored: {exc}",
+                )
+            return _pdf_failed_keep(
+                session, since_start, stored, decision, source_hash, str(exc) or exc.__class__.__name__,
+            )
+        if len(written) != len(graphs):
+            return _pdf_failed_keep(
+                session, since_start, stored, decision, source_hash,
+                "PDF recovery did not return one result for each requested graph",
+            )
+        if hashlib.sha256(output.read_bytes()).hexdigest() != opju_hash:
+            if not _restore_exact(output, snapshot):
+                return _preserve_outcome(session, since_start, "PDF recovery changed the saved project")
+            return _pdf_failed_keep(
+                session, since_start, stored, decision, source_hash,
+                "PDF recovery changed the saved project; the original bytes were restored",
+            )
+        installed: list[dict[str, Any]] = []
+        errors: list[dict[str, Any]] = []
+        for spec, item in zip(graphs, written):
+            final = Path(spec["final"])
+            if not item.get("ok") or not item.get("staged"):
+                errors.append(_pdf_error(spec, final, str(item.get("error") or "PDF export failed")))
+                continue
+            try:
+                validate_pdf_file(Path(item["staged"]))
+                _install_staged_file(Path(item["staged"]), final, overwrite=bool(job["overwrite"]))
+                checked = validate_pdf_file(final)
+            except Exception as exc:
+                errors.append(_pdf_error(spec, final, str(exc) or exc.__class__.__name__))
+                continue
+            installed.append({
+                "path": str(final),
+                "sha256": _sha256_file(final),
+                "size_bytes": final.stat().st_size,
+                "pages": checked["pages"],
+                "graph": spec["graph"],
+                "table": spec["table"],
+                "short_name": spec["short_name"],
+                "index": spec["index"],
+                "header": checked["header"],
+            })
+        if hashlib.sha256(output.read_bytes()).hexdigest() != opju_hash:
+            if not _restore_exact(output, snapshot):
+                return _preserve_outcome(session, since_start, "PDF install changed the saved project")
+            return _pdf_failed_keep(
+                session, since_start, stored, decision, source_hash,
+                "PDF install changed the saved project; the original bytes were restored",
+            )
+        merged = list(decision.get("keep_pdfs") or []) + installed
+        merged.sort(key=lambda item: int(item.get("index") or 0))
+        expected = len(decision.get("keep_pdfs") or []) + len(graphs)
+        pdf_status = "ok" if not errors and len(merged) == expected else "failed"
+        return {
+            "status": "succeeded",
+            "session": session,
+            "since_start": since_start,
+            "recycle": False,
+            "output": stored.get("output"),
+            "pdfs": merged,
+            "pdf_status": pdf_status,
+            "pdf_errors": errors,
+            "graph_identities": list(stored.get("graph_identities") or []),
+            "source_sha256": source_hash,
+            "warnings": [],
+            "resolved_plot": stored.get("resolved_plot"),
+            "error": None,
+        }
+    finally:
+        shutil.rmtree(stage_dir, ignore_errors=True)
 
 
 def _fingerprint(source_sha: str, read_options, plot, fmt: str, pdf: bool, output: str) -> str:
@@ -922,6 +1303,7 @@ def _finish_task(
     record, record_path, results, state, task, index, count, progress, warnings,
     *, status, error=None, output=None, pdfs=None, pdf_status="not_applicable",
     source_sha256=None, warnings_for_task=None, resolved_plot=None,
+    pdf_errors=None, graph_identities=None,
 ) -> None:
     entry = {
         "task_id": task["task_id"],
@@ -931,6 +1313,7 @@ def _finish_task(
         "output": output,
         "pdfs": list(pdfs or []),
         "pdf_status": pdf_status,
+        "pdf_errors": list(pdf_errors or []),
         "error": error,
         "warnings": list(warnings_for_task or []),
         "resolved_plot": resolved_plot,
@@ -941,9 +1324,9 @@ def _finish_task(
         "source_sha256": source_sha256,
         "fingerprint": None,
     }
-    # format/pdf/fingerprint are filled by the caller via job closure below when success.
     results.append({key: value for key, value in entry.items() if key in {
-        "task_id", "source", "sources", "status", "output", "pdfs", "pdf_status", "error", "warnings", "resolved_plot",
+        "task_id", "source", "sources", "status", "output", "pdfs", "pdf_status", "pdf_errors",
+        "error", "warnings", "resolved_plot",
     }})
     state["counts"][status] = state["counts"].get(status, 0) + 1
     if status == "succeeded" and pdf_status == "failed":
@@ -959,6 +1342,7 @@ def _finish_task(
             "output": None if not output else output.get("path"),
             "error": error,
             "pdf_status": pdf_status,
+            "pdf_errors": list(pdf_errors or []),
         })
         return
     event = {
@@ -971,6 +1355,7 @@ def _finish_task(
         "output": None if not output else output.get("path"),
         "error": error,
         "pdf_status": pdf_status,
+        "pdf_errors": list(pdf_errors or []),
     }
     _emit(record_path, progress, warnings, event)
     if status != "succeeded":
@@ -996,6 +1381,8 @@ def _finish_task(
             "pdf_status": pdf_status,
             "output": output,
             "pdfs": list(pdfs or []),
+            "pdf_errors": list(pdf_errors or []),
+            "graph_identities": list(graph_identities or []),
             "resolved_plot": resolved_plot,
             "fingerprint": _fingerprint(
                 source_sha256 or "",
@@ -1042,6 +1429,7 @@ def _result(job, results, state, warnings, max_resident: int) -> dict[str, Any]:
             "starts": state["origin_starts"],
             "stops": state["origin_stops"],
             "owned_pids": list(state["owned_pids"]),
+            "owned_processes": list(state.get("owned_processes") or []),
             "recycled": state["recycled"],
         },
         "resident": {"max_full_tasks": max_resident, "limit": job["max_resident_tasks"]},
@@ -1067,7 +1455,7 @@ def _open_record(record_path: Path, *, resume: bool, retry_ids: list[str]) -> tu
         warning = "batch record was restored from the last complete backup"
         save_batch_record(record_path, record)
     if retry_ids:
-        retry_batch_tasks(record_path, task_ids=list(retry_ids), statuses=("failed", "cancelled", "blocked", "succeeded"))
+        retry_batch_tasks(record_path, task_ids=list(retry_ids))
         record = load_batch_record(record_path)
     return record, warning
 
