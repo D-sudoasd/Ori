@@ -2,12 +2,18 @@
 
 from __future__ import annotations
 
+import json
 import re
+from contextlib import nullcontext
+from copy import deepcopy
 from dataclasses import replace
 from datetime import datetime, timezone
 from decimal import Decimal, InvalidOperation
 from pathlib import Path
-from typing import Any, Mapping
+from typing import TYPE_CHECKING, Any, Mapping
+
+if TYPE_CHECKING:
+    from .source_cache import SourceCache
 
 from .models import (
     DataColumn,
@@ -351,7 +357,9 @@ def _read_options_for_table(table: DataTable) -> dict[str, Any]:
     return options
 
 
-def _read_inputs(paths: list[Path], options: dict[str, Any] | None) -> list[tuple[Path, DataTable]]:
+def _read_inputs(
+    paths: list[Path], options: dict[str, Any] | None, cache: SourceCache | None = None
+) -> list[tuple[Path, DataTable]]:
     if not isinstance(paths, list) or not paths:
         raise DataImportError("At least one input path is required")
     raw_paths: list[Path] = []
@@ -368,7 +376,7 @@ def _read_inputs(paths: list[Path], options: dict[str, Any] | None) -> list[tupl
         path = _absolute(raw_path)
         if not path.is_file():
             raise DataImportError(f"Input is not a readable file: {path}")
-        tables = _read_tables(path, **request_options)
+        tables = (cache.read if cache is not None else _read_tables)(path, **request_options)
         if not isinstance(tables, list) or not tables:
             raise DataImportError(f"Reader returned no tables for {path}")
         for table in tables:
@@ -379,44 +387,43 @@ def _read_inputs(paths: list[Path], options: dict[str, Any] | None) -> list[tupl
     return result
 
 
-def inspect_inputs(paths: list[Path], options: dict[str, Any] | None = None) -> dict[str, Any]:
+def inspect_inputs(
+    paths: list[Path], options: dict[str, Any] | None = None, *, cache: SourceCache | None = None
+) -> dict[str, Any]:
     """Read input files and return a JSON-safe schema and plot suggestions."""
     tables: list[dict[str, Any]] = []
     used_names: set[str] = set()
-    for path, table in _read_inputs(paths, options):
-        source_path, digest = _source_identity(table, path)
-        read_options = _read_options_for_table(table)
-        plot, suggestion_warnings = _suggest_plot(table)
-        columns = []
-        for index, column in enumerate(table.columns):
-            columns.append(
-                {
-                    "index": index,
-                    "name": column.name,
-                    "kind": column.kind,
-                    "unit": column.unit,
-                    "missing": sum(value is None for value in column.values),
-                    "sample": list(column.values[:5]),
-                    "range": _column_range(column),
-                }
-            )
-        source_sheet = table.source_sheet if table.source_sheet is not None else read_options["sheet"]
-        tables.append(
-            {
-                "source": {
-                    "path": str(source_path),
-                    "sheet": source_sheet,
-                    "sha256": digest,
-                    "options": read_options,
-                },
-                "name": _unique_target_name(table.name, used_names),
-                "n_rows": table.n_rows,
-                "columns": columns,
-                "warnings": list(table.warnings) + suggestion_warnings,
-                "suggested_plot": plot,
-            }
-        )
+    with cache.operation() if cache is not None else nullcontext():
+        for path, table in _read_inputs(paths, options, cache):
+            def build():
+                return _inspect_table(path, table)
+            summary = cache.summary(table, build) if cache is not None else build()
+            summary["name"] = _unique_target_name(table.name, used_names)
+            tables.append(summary)
     return {"schema_version": SCHEMA_VERSION, "tables": tables}
+
+
+def _inspect_table(path: Path, table: DataTable) -> dict[str, Any]:
+    source_path, digest = _source_identity(table, path)
+    read_options = _read_options_for_table(table)
+    plot, suggestion_warnings = _suggest_plot(table)
+    columns = [
+        {
+            "index": index, "name": column.name, "kind": column.kind, "unit": column.unit,
+            "missing": sum(value is None for value in column.values),
+            "sample": list(column.values[:5]), "range": _column_range(column),
+        }
+        for index, column in enumerate(table.columns)
+    ]
+    return {
+        "source": {
+            "path": str(source_path),
+            "sheet": table.source_sheet if table.source_sheet is not None else read_options["sheet"],
+            "sha256": digest, "options": read_options,
+        },
+        "name": table.name, "n_rows": table.n_rows, "columns": columns,
+        "warnings": list(table.warnings) + suggestion_warnings, "suggested_plot": plot,
+    }
 
 
 def _output_path(path: Path | str, file_format: str) -> Path:
@@ -440,6 +447,8 @@ def create_plan(
     options: dict[str, Any] | None = None,
     overwrite: bool = False,
     keep_open: bool = False,
+    *,
+    cache: SourceCache | None = None,
 ) -> dict[str, Any]:
     """Build an explicit version-1 import plan without writing files or starting Origin."""
     if not isinstance(overwrite, bool) or not isinstance(keep_open, bool):
@@ -450,7 +459,7 @@ def create_plan(
         raise DataImportError("output must be a path string or pathlib.Path")
     if format == "xlsx" and keep_open:
         raise DataImportError("output.keep_open is only valid for opju output")
-    inspection = inspect_inputs(paths, options)
+    inspection = inspect_inputs(paths, options, cache=cache)
     target = _output_path(output, format)
     plan_tables = []
     for table in inspection["tables"]:
@@ -688,7 +697,7 @@ def _canonical_output(value: Any, base_dir: Path | None) -> tuple[Path, str, boo
     return target, file_format, overwrite, keep_open
 
 
-def _load_and_verify_source(source: Any, base_dir: Path | None, table_index: int) -> DataTable:
+def _source_request(source: Any, base_dir: Path | None, table_index: int) -> tuple[Path, str, dict[str, Any]]:
     item = _require_object(source, f"tables[{table_index}].source", {"path", "sha256", "options"})
     required = {"path", "sha256", "options"}
     missing = required - set(item)
@@ -702,7 +711,17 @@ def _load_and_verify_source(source: Any, base_dir: Path | None, table_index: int
     if not isinstance(expected_hash, str) or not _SHA256_RE.fullmatch(expected_hash.lower()):
         raise DataImportError(f"tables[{table_index}].source.sha256 must be a 64-character SHA-256")
     options = _validate_options(item["options"], replayable=True)
-    loaded = _read_tables(source_path, **options)
+    return source_path, expected_hash.lower(), options
+
+
+def _load_and_verify_source(
+    source: Any, base_dir: Path | None, table_index: int, cache: SourceCache | None = None,
+    preloaded: DataTable | None = None,
+) -> DataTable:
+    source_path, expected_hash, options = _source_request(source, base_dir, table_index)
+    loaded = [preloaded] if preloaded is not None else (
+        cache.read if cache is not None else _read_tables
+    )(source_path, **options)
     if not isinstance(loaded, list) or len(loaded) != 1:
         count = len(loaded) if isinstance(loaded, list) else "invalid"
         raise DataImportError(
@@ -719,11 +738,41 @@ def _load_and_verify_source(source: Any, base_dir: Path | None, table_index: int
     actual_options = _read_options_for_table(table)
     if actual_options != options:
         raise DataImportError(f"Reader options are not replayable for {source_path}; inspect the source again")
-    return table
+    # Multiple plan items may use the same preloaded sheet with different plots.
+    # Keep its immutable values shared, but isolate each item's provenance options.
+    return replace(table, read_options=deepcopy(table.read_options)) if preloaded is not None else table
 
 
-def prepare_plan(plan: dict[str, Any], base_dir: Path | None = None) -> PreparedImport:
+def _workbook_group_key(path: Path, digest: str, options: dict[str, Any]) -> tuple[Path, str, str]:
+    return path, digest, json.dumps(dict(options, sheet=None), sort_keys=True)
+
+
+def _workbook_source_groups(raw_tables: list[Any], base_dir: Path | None):
+    """Group metadata only; parse each workbook when its first table is needed."""
+    groups: dict[tuple[Path, str, str], tuple[dict[str, Any], list[str]]] = {}
+    for index, raw in enumerate(raw_tables):
+        if not isinstance(raw, Mapping) or "source" not in raw:
+            continue  # The ordinary validator supplies the table-specific error.
+        path, digest, options = _source_request(raw["source"], base_dir, index)
+        if path.suffix.casefold() not in {".xlsx", ".xlsm", ".xls"} or options["sheet"] is None:
+            continue
+        common = dict(options, sheet=None)
+        key = _workbook_group_key(path, digest, common)
+        _, sheets = groups.setdefault(key, (common, []))
+        if options["sheet"] not in sheets:
+            sheets.append(options["sheet"])
+    return {key: value for key, value in groups.items() if len(value[1]) > 1}
+
+
+def prepare_plan(
+    plan: dict[str, Any], base_dir: Path | None = None, *, cache: SourceCache | None = None
+) -> PreparedImport:
     """Validate a declarative plan and resolve every source without writing or starting Origin."""
+    with cache.operation() if cache is not None else nullcontext():
+        return _prepare_plan(plan, base_dir, cache)
+
+
+def _prepare_plan(plan: dict[str, Any], base_dir: Path | None, cache: SourceCache | None) -> PreparedImport:
     root = _require_object(plan, "plan", {"schema_version", "output", "tables"})
     required = {"schema_version", "output", "tables"}
     missing = required - set(root)
@@ -739,6 +788,10 @@ def prepare_plan(plan: dict[str, Any], base_dir: Path | None = None) -> Prepared
     raw_tables = root["tables"]
     if not isinstance(raw_tables, list) or not raw_tables:
         raise DataImportError("plan.tables must be a non-empty array")
+    groups = _workbook_source_groups(raw_tables, resolved_base) if cache is not None else {}
+    # These references share immutable values with the prepared result, including
+    # oversized workbooks. They disappear with this call, independent of the LRU.
+    loaded_groups: dict[tuple[Path, str, str], dict[str | None, DataTable]] = {}
     planned: list[PlannedTable] = []
     names: set[str] = set()
     input_paths: set[Path] = set()
@@ -764,7 +817,18 @@ def prepare_plan(plan: dict[str, Any], base_dir: Path | None = None) -> Prepared
         source_path = _absolute(raw_source_path, resolved_base)
         input_paths.add(source_path)
         path_sheet_counts[source_path] = path_sheet_counts.get(source_path, 0) + 1
-        table = _load_and_verify_source(table_item["source"], resolved_base, index)
+        preloaded = None
+        if cache is not None:
+            _path, digest, options = _source_request(source_mapping, resolved_base, index)
+            key = _workbook_group_key(source_path, digest, options)
+            if key in groups and key not in loaded_groups:
+                common, sheets = groups[key]
+                loaded_groups[key] = {
+                    item.source_sheet: item
+                    for item in cache.read_sheets(source_path, tuple(sheets), common)
+                }
+            preloaded = loaded_groups.get(key, {}).get(options["sheet"])
+        table = _load_and_verify_source(table_item["source"], resolved_base, index, cache, preloaded)
         columns = _label_columns(table_item["column_labels"], table, name)
         plot_warnings: list[str] = []
         plot = _validate_plot(table_item["plot"], table, name, plot_warnings, columns)

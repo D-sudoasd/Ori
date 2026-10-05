@@ -22,6 +22,39 @@ MCP_AVAILABLE = importlib.util.find_spec("mcp") is not None
 
 @unittest.skipUnless(MCP_AVAILABLE, "install requirements-agent.txt for MCP tests")
 class McpStdioRoundTripTests(unittest.TestCase):
+    def test_combined_inspection_plan_and_execute_over_stdio(self) -> None:
+        from mcp import Client, StdioServerParameters
+
+        async def run(root):
+            source = root / "measurement.tsv"
+            source.write_text("Time (s)\tVoltage (V)\n0\t1.25\n1\t2.5\n", encoding="utf-8")
+            output = root / "result.xlsx"
+            parameters = StdioServerParameters(command=sys.executable, args=["-m", "origin_bridge.mcp_server"])
+            async with Client(parameters) as client:
+                planned = await client.call_tool("create_import_plan", {
+                    "paths": [str(source)], "output_path": str(output),
+                    "output_format": "xlsx", "include_inspection": True,
+                })
+                self.assertFalse(planned.is_error, _tool_error(planned))
+                result = planned.structured_content
+                self.assertEqual(result["inspection"]["tables"][0]["columns"][1]["sample"], ["1.25", "2.5"])
+                plan = result["plan"]
+                plan["tables"][0]["column_labels"] = {"Voltage": {"name": "Signal", "unit": "V"}}
+                self.assertFalse(output.exists())
+                exported = await client.call_tool("execute_import_plan", {"plan": plan, "confirm": True})
+                self.assertFalse(exported.is_error, _tool_error(exported))
+                self.assertTrue(exported.structured_content["ok"])
+            book = load_workbook(output, read_only=True, data_only=True)
+            try:
+                self.assertEqual(book.worksheets[0].cell(1, 2).value, "Signal")
+                self.assertEqual(book.worksheets[0].cell(3, 2).value, 2.5)
+                self.assertIn("Provenance", book.sheetnames)
+            finally:
+                book.close()
+
+        with tempfile.TemporaryDirectory(prefix="mcp-combined-import-") as temp:
+            asyncio.run(run(Path(temp)))
+
     def test_stdio_client_inspect_plan_validate_and_import_xlsx(self) -> None:
         self.assertIsNotNone(Workbook, "install requirements.txt for XLSX tests")
         from mcp import Client, StdioServerParameters

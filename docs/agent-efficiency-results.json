@@ -1,0 +1,231 @@
+{
+  "date": "2026-10-05",
+  "baseline_commit": "40df76fbf345afca013f5ccf3032ade2fd2d5851",
+  "environment": {
+    "os": "Windows",
+    "python": "3.13.0",
+    "openpyxl": "3.1.5",
+    "mcp": "2.2.0",
+    "xlrd": "2.0.2"
+  },
+  "rows_per_table": 2000,
+  "repeats": 5,
+  "timing": "median; process startup, fixture generation and first SDK import excluded",
+  "table_content_matches": true,
+  "before": [
+    {
+      "task": "cli_tsv_import",
+      "tool_calls": 1,
+      "source_reads": 3,
+      "parse_calls": 2,
+      "workbook_opens": 0,
+      "range_calls": 2,
+      "conversion_checks": 1,
+      "final_source_checks": 1,
+      "elapsed_s": 0.0974,
+      "data_sha256": "195e189e50e4286e0bd1526def02668550d29818116b93ff0ca569ea31350828",
+      "table_rows": {
+        "stress": 2001
+      }
+    },
+    {
+      "task": "cli_four_sheet_import",
+      "tool_calls": 1,
+      "source_reads": 6,
+      "parse_calls": 5,
+      "workbook_opens": 10,
+      "range_calls": 8,
+      "conversion_checks": 1,
+      "final_source_checks": 1,
+      "elapsed_s": 0.7559,
+      "data_sha256": "62a0b3945d36f0e7ede9751af061ea01fd9a5e31013c7fa48fffd22ecb37d56a",
+      "table_rows": {
+        "multi_Run1": 2001,
+        "multi_Run2": 2001,
+        "multi_Run3": 2001,
+        "multi_Run4": 2001
+      }
+    },
+    {
+      "task": "cli_saved_four_sheet_plan",
+      "tool_calls": 1,
+      "source_reads": 5,
+      "parse_calls": 4,
+      "workbook_opens": 8,
+      "range_calls": 0,
+      "conversion_checks": 1,
+      "final_source_checks": 1,
+      "elapsed_s": 0.5503,
+      "data_sha256": "62a0b3945d36f0e7ede9751af061ea01fd9a5e31013c7fa48fffd22ecb37d56a",
+      "table_rows": {
+        "multi_Run1": 2001,
+        "multi_Run2": 2001,
+        "multi_Run3": 2001,
+        "multi_Run4": 2001
+      }
+    },
+    {
+      "task": "mcp_four_tools",
+      "tool_calls": 4,
+      "source_reads": 5,
+      "parse_calls": 4,
+      "workbook_opens": 0,
+      "range_calls": 4,
+      "conversion_checks": 2,
+      "final_source_checks": 1,
+      "elapsed_s": 0.1415,
+      "data_sha256": "195e189e50e4286e0bd1526def02668550d29818116b93ff0ca569ea31350828",
+      "table_rows": {
+        "stress": 2001
+      }
+    },
+    {
+      "task": "mcp_plan_execute",
+      "tool_calls": 2,
+      "source_reads": 3,
+      "parse_calls": 2,
+      "workbook_opens": 0,
+      "range_calls": 2,
+      "conversion_checks": 1,
+      "final_source_checks": 1,
+      "elapsed_s": 0.1049,
+      "data_sha256": "195e189e50e4286e0bd1526def02668550d29818116b93ff0ca569ea31350828",
+      "table_rows": {
+        "stress": 2001
+      }
+    }
+  ],
+  "after": [
+    {
+      "task": "cli_tsv_import",
+      "tool_calls": 1,
+      "source_reads": 2,
+      "parse_calls": 1,
+      "workbook_opens": 0,
+      "range_calls": 2,
+      "conversion_checks": 1,
+      "final_source_checks": 1,
+      "elapsed_s": 0.0924,
+      "data_sha256": "195e189e50e4286e0bd1526def02668550d29818116b93ff0ca569ea31350828",
+      "table_rows": {
+        "stress": 2001
+      }
+    },
+    {
+      "task": "cli_four_sheet_import",
+      "tool_calls": 1,
+      "source_reads": 2,
+      "parse_calls": 1,
+      "workbook_opens": 2,
+      "range_calls": 8,
+      "conversion_checks": 1,
+      "final_source_checks": 1,
+      "elapsed_s": 0.5235,
+      "data_sha256": "62a0b3945d36f0e7ede9751af061ea01fd9a5e31013c7fa48fffd22ecb37d56a",
+      "table_rows": {
+        "multi_Run1": 2001,
+        "multi_Run2": 2001,
+        "multi_Run3": 2001,
+        "multi_Run4": 2001
+      }
+    },
+    {
+      "task": "cli_saved_four_sheet_plan",
+      "tool_calls": 1,
+      "source_reads": 2,
+      "parse_calls": 1,
+      "workbook_opens": 2,
+      "range_calls": 0,
+      "conversion_checks": 1,
+      "final_source_checks": 1,
+      "elapsed_s": 0.5269,
+      "data_sha256": "62a0b3945d36f0e7ede9751af061ea01fd9a5e31013c7fa48fffd22ecb37d56a",
+      "table_rows": {
+        "multi_Run1": 2001,
+        "multi_Run2": 2001,
+        "multi_Run3": 2001,
+        "multi_Run4": 2001
+      }
+    },
+    {
+      "task": "mcp_four_tools",
+      "tool_calls": 4,
+      "source_reads": 5,
+      "parse_calls": 1,
+      "workbook_opens": 0,
+      "range_calls": 2,
+      "conversion_checks": 2,
+      "final_source_checks": 1,
+      "elapsed_s": 0.1199,
+      "data_sha256": "195e189e50e4286e0bd1526def02668550d29818116b93ff0ca569ea31350828",
+      "table_rows": {
+        "stress": 2001
+      }
+    },
+    {
+      "task": "mcp_plan_execute",
+      "tool_calls": 2,
+      "source_reads": 3,
+      "parse_calls": 1,
+      "workbook_opens": 0,
+      "range_calls": 2,
+      "conversion_checks": 1,
+      "final_source_checks": 1,
+      "elapsed_s": 0.1133,
+      "data_sha256": "195e189e50e4286e0bd1526def02668550d29818116b93ff0ca569ea31350828",
+      "table_rows": {
+        "stress": 2001
+      }
+    }
+  ],
+  "validation": {
+    "unittest": {
+      "total": 240,
+      "passed": 213,
+      "skipped_opt_in": 27,
+      "failures": 0,
+      "errors": 0
+    },
+    "packaged_checks": [
+      "direct TSV CLI import",
+      "saved four-sheet plan CLI replay",
+      "frozen GUI background worker"
+    ],
+    "preserved_outputs": [
+      "table values",
+      "missing cells",
+      "Provenance"
+    ],
+    "lint": "Ruff E4/E7/E9/F on changed runtime and new scripts/tests",
+    "not_run_locally": [
+      "opt-in interactive GUI",
+      "real Origin",
+      "Python 3.10"
+    ],
+    "routing_examples": [
+      {
+        "path": "README.md",
+        "mode": "none",
+        "test_cases": 0,
+        "build": false
+      },
+      {
+        "path": "origin_bridge/cli.py",
+        "mode": "targeted",
+        "test_cases": 28,
+        "build": false
+      },
+      {
+        "path": "origin_bridge/mcp_server.py",
+        "mode": "targeted",
+        "test_cases": 2,
+        "build": false
+      },
+      {
+        "path": "origin_bridge/readers.py",
+        "mode": "full",
+        "build": true
+      }
+    ]
+  }
+}

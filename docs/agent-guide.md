@@ -35,18 +35,20 @@ py -3 -m origin_bridge.mcp_server
 | 工具 | 行为 |
 | --- | --- |
 | `inspect_data(paths, options?)` | 读取文件并返回工作表、列类型、缺失数、样例、范围、警告和图形建议。不写文件，也不启动 Origin。 |
-| `create_import_plan(paths, output_path, output_format?, options?, overwrite?, keep_open?)` | 创建版本化导入计划，不写输出，也不启动 Origin。`output_format` 默认是 `opju`；默认不覆盖已有文件。 |
-| `validate_import_plan(plan, base_dir?)` | 重新读取源数据，核对 SHA-256、读入选项、列映射、图形设置和输出路径；不写输出，也不启动 Origin。 |
-| `execute_import_plan(plan, confirm, base_dir?)` | 再次校验并执行。必须显式传入 `confirm=true`；只会在计划 `overwrite=true` 时替换已有文件。 |
+| `create_import_plan(paths, output_path, output_format?, options?, overwrite?, keep_open?, include_inspection?)` | 创建版本化计划。`include_inspection=true` 时一次返回 `{plan, inspection}`，含类型、样例、范围、缺失数和警告；省略时仍返回计划本身。默认格式 `opju`，不覆盖已有文件。 |
+| `validate_import_plan(plan, base_dir?)` | 只读校验最终计划、来源 SHA-256、列映射、图形、数值/日期转换和输出路径。需要在写出前单独查看校验结果时使用。 |
+| `execute_import_plan(plan, confirm, base_dir?)` | 校验最终计划并执行，无须先调用独立校验工具。必须传入 `confirm=true`；只在计划 `overwrite=true` 时替换已有文件。 |
 
 服务在本机解析源文件并写入输出；源路径、列信息和样例会通过 MCP 返回给客户端。客户端如何保留或处理这些返回数据，取决于所用 MCP 客户端的策略。源路径须为服务进程可访问的本地路径。
 
 ## 建议的 agent 流程
 
-1. 调用 `inspect_data` 检查所有输入文件。确认自动识别的列名、类型、样例、工作表以及缺失值处理符合来源数据。
-2. 调用 `create_import_plan` 生成计划。若默认图形或命名不合适，直接修改返回的计划对象；也可通过 CLI 的 `plan --save` 写成 JSON 后编辑。
-3. 调用 `validate_import_plan` 校验最终计划。若源文件在检查后发生变化，必须重新检查并生成计划；不要忽略哈希不匹配。
-4. 用户确认输出路径和图形后，将同一份计划传入 `execute_import_plan`，并设置 `confirm=true`。记录返回的输出路径和 SHA-256。
+1. 已有明确导入目标时，调用 `create_import_plan(..., include_inspection=true)`，一次取得计划和来源摘要；只传本任务需要的路径。检查类型、样例、缺失值和图形。只需要了解数据而尚无导出目标时才单独调用 `inspect_data`。
+2. 需要时编辑返回的 `plan`。已有用户对输出和操作范围的授权即可调用 `execute_import_plan(plan, confirm=true)`；执行器自行校验最终计划。记录回执中的输出路径和 SHA-256。
+
+修改列映射后仍有疑问、需要先查看转换警告、校验失败或另有只读审阅要求时，调用 `validate_import_plan`。来源内容变化后重新检查并生成计划，不忽略哈希不匹配。独立校验不代替执行时的检查，反复校验未变计划不会增加保障。
+
+同一 MCP 服务进程默认复用已解析的来源和表结构摘要。每次工具调用对相关文件重新计算内容 SHA-256；读取选项或内容变化即失效，同大小同修改时间的改写也会识别。缓存采用 LRU，最多 8 次读取、32 MiB 的估算数据与摘要容量；超限来源正常读入但不保留。服务退出后缓存消失。CLI 在一条命令内复用，不建立跨进程磁盘缓存。执行前的来源核对、计划校验和写出结果检查保留。
 
 `inspect_data` 对自动表头和绘图的建议是规则推断。遇到全文本列、混合类型或没有明确的 X 列时，先检查返回的样例和警告，再确定表头与映射。所有源列都会保留；X/Y 选择只控制绘图。
 
@@ -55,8 +57,8 @@ py -3 -m origin_bridge.mcp_server
 每条 CLI 命令输出 UTF-8 JSON。Windows PowerShell：
 
 ```powershell
-# 递归检查目录下所有支持的文件
-py -3 -m origin_bridge inspect -i .\examples_general
+# 只检查当前来源；明确传目录时才递归展开
+py -3 -m origin_bridge inspect -i .\examples_general\stress_strain.tsv
 
 # 创建可审阅的 OPJU 计划
 py -3 -m origin_bridge plan `
@@ -64,9 +66,11 @@ py -3 -m origin_bridge plan `
   -o .\out\stress.opju `
   --save .\out\stress-plan.json
 
-# 校验后执行
-py -3 -m origin_bridge validate .\out\stress-plan.json
+# 审阅计划后执行，执行器会完成校验
 py -3 -m origin_bridge execute .\out\stress-plan.json
+
+# 需要只读校验结果或转换警告时单独使用
+py -3 -m origin_bridge validate .\out\stress-plan.json
 
 # 立即生成无图形的 XLSX 表格
 py -3 -m origin_bridge import `
@@ -170,4 +174,6 @@ CLI 可通过 `--plot auto|none|line|scatter|line_symbol|column` 指定图形，
 
 通用数据窗口在后台展开文件夹，并按**单个路径**调用检查。摘要缓存只保存列结构、最多几行样例和图形建议，不保存完整原始表。缓存是否有效看文件内容 SHA-256 和本次读取选项，不看文件大小或修改时间。
 
-`GeneralDataApp.batch_source_snapshot()` 是留给后续批量阶段的只读入口，内容是路径、成功摘要和来源错误。它不启动导出，也没有取消或 manifest。单工程在存在失败或未完成来源时会拒绝计划；批量阶段不能假设每个来源都检查成功。前缀分组、批量任务配置和批量导出都不在这一阶段。
+默认“每个来源一个文件”只发现路径并预览选中的来源；合并工程才检查全部来源。`GeneralDataApp.batch_source_snapshot()` 返回路径、成功摘要和来源错误；存在失败或未完成来源时，单工程拒绝计划。按文件批次的配置、取消和恢复由现有 [batch API](batch-api.md) 管理，不用摘要缓存代替执行检查。
+
+仓库改造与验证范围见 [开发指南](development.md)；可复现的解析/I/O 对比见 [效率验证记录](agent-efficiency.md)。

@@ -3,8 +3,8 @@
 Install the optional dependency with ``python -m pip install -r
 requirements-agent.txt``, then run ``python -m origin_bridge.mcp_server``.
 
-The server exposes a declarative workflow: inspect source files, create and
-validate a JSON import plan, then explicitly execute that plan. Execution can
+The server creates reviewable JSON plans and explicitly executes them. Source
+inspection and standalone validation are available when needed. Execution can
 write an XLSX file or start Origin and write an OPJU project. It never accepts
 Python, LabTalk, shell commands, or executable plan fields.
 """
@@ -52,6 +52,7 @@ def build_server() -> Any:
     # Import the application layer only after the optional SDK is available.
     from .exporter import execute_import
     from .models import DataImportError
+    from .source_cache import SourceCache
     from .planning import (
         create_plan,
         describe_prepared,
@@ -60,6 +61,7 @@ def build_server() -> Any:
     )
 
     server = MCPServer("DataToOrigin")
+    cache = SourceCache()
 
     def expected_error(exc: Exception) -> ToolError:
         """Report rejected data and filesystem conditions without a server traceback."""
@@ -73,7 +75,7 @@ def build_server() -> Any:
         Paths are local paths visible to the machine running this MCP server.
         """
         try:
-            return inspect_inputs(_source_paths(paths), options)
+            return inspect_inputs(_source_paths(paths), options, cache=cache)
         except (DataImportError, OSError, ValueError) as exc:
             raise expected_error(exc) from exc
 
@@ -85,25 +87,29 @@ def build_server() -> Any:
         options: dict[str, Any] | None = None,
         overwrite: bool = False,
         keep_open: bool = False,
+        include_inspection: bool = False,
     ) -> dict[str, Any]:
         """Create a declarative JSON import plan without writing output or starting Origin.
 
-        output_format is "opju" or "xlsx". The plan records source hashes and
-        column/plot choices so it can be reviewed and validated before execution.
+        output_format is "opju" or "xlsx". Use include_inspection=true to return
+        {plan, inspection} with types, samples, ranges and warnings in one call.
+        Otherwise returns the plan itself. Review the result, then execute it;
+        standalone validation is useful for edits or unresolved mapping questions.
         """
         try:
             if not isinstance(output_path, str) or not output_path.strip():
                 raise ValueError("output_path must be a non-empty file path")
-            if type(overwrite) is not bool or type(keep_open) is not bool:
-                raise ValueError("overwrite and keep_open must be boolean values")
-            return create_plan(
-                _source_paths(paths),
-                Path(output_path).expanduser(),
-                format=output_format,
-                options=options,
-                overwrite=overwrite,
-                keep_open=keep_open,
-            )
+            if any(type(value) is not bool for value in (overwrite, keep_open, include_inspection)):
+                raise ValueError("overwrite, keep_open and include_inspection must be boolean values")
+            sources = _source_paths(paths)
+            with cache.operation():
+                plan = create_plan(
+                    sources, Path(output_path).expanduser(), format=output_format,
+                    options=options, overwrite=overwrite, keep_open=keep_open, cache=cache,
+                )
+                if include_inspection:
+                    return {"plan": plan, "inspection": inspect_inputs(sources, options, cache=cache)}
+                return plan
         except (DataImportError, OSError, ValueError) as exc:
             raise expected_error(exc) from exc
 
@@ -117,7 +123,7 @@ def build_server() -> Any:
         resolve relative source paths from the directory containing a saved plan.
         """
         try:
-            prepared = prepare_plan(plan, base_dir=_base_path(base_dir))
+            prepared = prepare_plan(plan, base_dir=_base_path(base_dir), cache=cache)
             return {"valid": True, "prepared": describe_prepared(prepared)}
         except (DataImportError, OSError, ValueError) as exc:
             raise expected_error(exc) from exc
@@ -135,10 +141,10 @@ def build_server() -> Any:
         if type(confirm) is not bool or not confirm:
             raise ToolError(
                 "Execution was not authorized. Call this tool with confirm=true "
-                "after reviewing the plan and validate_import_plan result."
+                "after reviewing the plan. Execution validates the final plan."
             )
         try:
-            prepared = prepare_plan(plan, base_dir=_base_path(base_dir))
+            prepared = prepare_plan(plan, base_dir=_base_path(base_dir), cache=cache)
             return execute_import(prepared)
         except (DataImportError, OSError, ValueError) as exc:
             raise expected_error(exc) from exc

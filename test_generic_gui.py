@@ -208,7 +208,14 @@ class GenericGuiContractTests(unittest.TestCase):
         calls = []
         prepared = object()
         planning_module = types.ModuleType("origin_bridge.planning")
-        planning_module.prepare_plan = lambda plan, base_dir=None: calls.append(("prepare", plan, base_dir)) or prepared
+        def prepare(plan, base_dir=None, *, cache=None):
+            from origin_bridge.source_cache import SourceCache
+
+            self.assertIsInstance(cache, SourceCache)
+            calls.append(("prepare", plan, base_dir))
+            return prepared
+
+        planning_module.prepare_plan = prepare
         exporter_module = types.ModuleType("origin_bridge.exporter")
         exporter_module.execute_import = lambda value: calls.append(("export", value)) or {
             "ok": True,

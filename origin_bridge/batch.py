@@ -632,6 +632,7 @@ def _execute_unified(job, *, progress, cancel_event) -> dict[str, Any]:
     """Legacy single-project export. It holds every selected table until that one file is written."""
     from .exporter import execute_import
     from .planning import create_plan, prepare_plan
+    from .source_cache import SourceCache
 
     warnings = [
         "unified layout keeps every selected table in memory until the single output is written"
@@ -676,16 +677,19 @@ def _execute_unified(job, *, progress, cancel_event) -> dict[str, Any]:
     launches_before = OriginSession.launch_count
     closes_before = OriginSession.close_count
     try:
-        plan = create_plan(
-            paths,
-            output,
-            format=job["format"],
-            options=job["read_options"],
-            overwrite=bool(job["overwrite"]),
-            keep_open=bool(job["keep_open"]),
-        )
-        _apply_unified_plot(plan, job["plot"])
-        prepared = prepare_plan(plan)
+        cache = SourceCache()
+        with cache.operation():
+            plan = create_plan(
+                paths,
+                output,
+                format=job["format"],
+                options=job["read_options"],
+                overwrite=bool(job["overwrite"]),
+                keep_open=bool(job["keep_open"]),
+                cache=cache,
+            )
+            _apply_unified_plot(plan, job["plot"])
+            prepared = prepare_plan(plan, cache=cache)
         receipt = execute_import(prepared)
     except FileExistsError as exc:
         _finish_task(record, record_path, results, state, task, 0, 1, progress, warnings,

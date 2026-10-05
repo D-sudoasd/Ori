@@ -112,9 +112,18 @@ def read_tables(path: Path, **options: Any) -> list[DataTable]:
         source_bytes = resolved.read_bytes()
     except OSError as exc:
         raise DataImportError(f"无法读取文件 {resolved.name}：{exc}") from exc
+    return _parse_tables(resolved, source_bytes, settings)
+
+
+def _parse_tables(
+    resolved: Path, source_bytes: bytes, settings: dict[str, Any], source_hash: str | None = None,
+    selected_sheets: tuple[str, ...] | None = None,
+) -> list[DataTable]:
+    """Parse a verified byte snapshot; shared by ordinary and cached reads."""
+    suffix = resolved.suffix.casefold()
     if not source_bytes:
         raise DataImportError(f"文件为空：{resolved.name}")
-    source_hash = hashlib.sha256(source_bytes).hexdigest()
+    source_hash = source_hash or hashlib.sha256(source_bytes).hexdigest()
 
     if suffix in _TEXT_EXTENSIONS:
         text, actual_encoding = _decode_text(source_bytes, settings["encoding"], resolved)
@@ -140,7 +149,7 @@ def read_tables(path: Path, **options: Any) -> list[DataTable]:
         ]
 
     if suffix in {".xlsx", ".xlsm", ".xls"}:
-        return _read_excel(resolved, source_bytes, source_hash, settings)
+        return _read_excel(resolved, source_bytes, source_hash, settings, selected_sheets)
 
     if suffix in _JSONL_EXTENSIONS:
         text, actual_encoding = _decode_text(source_bytes, settings["encoding"], resolved)
@@ -409,7 +418,10 @@ def _scalar_json_value(value: Any, path: Path, row_number: int) -> Any:
     return str(value)
 
 
-def _read_excel(path: Path, source_bytes: bytes, source_hash: str, settings: dict[str, Any]) -> list[DataTable]:
+def _read_excel(
+    path: Path, source_bytes: bytes, source_hash: str, settings: dict[str, Any],
+    selected_sheets: tuple[str, ...] | None = None,
+) -> list[DataTable]:
     try:
         import openpyxl
     except ImportError as exc:
@@ -420,7 +432,7 @@ def _read_excel(path: Path, source_bytes: bytes, source_hash: str, settings: dic
             import xlrd
         except ImportError as exc:
             raise DataImportError("读取旧版 .xls 文件需要安装 xlrd。") from exc
-        return _read_xls(path, source_bytes, source_hash, settings, xlrd)
+        return _read_xls(path, source_bytes, source_hash, settings, xlrd, selected_sheets)
 
     formula_policy = settings["formula_policy"]
     try:
@@ -435,7 +447,12 @@ def _read_excel(path: Path, source_bytes: bytes, source_hash: str, settings: dic
     except Exception as exc:
         raise DataImportError(f"无法读取 Excel 文件 {path.name}：{exc}") from exc
     try:
-        if settings["sheet"] is not None:
+        if selected_sheets is not None:
+            sheet_names = list(selected_sheets)
+            for sheet_name in sheet_names:
+                if sheet_name not in workbook.sheetnames:
+                    raise DataImportError(f"{path.name} 中不存在工作表：{sheet_name}")
+        elif settings["sheet"] is not None:
             if settings["sheet"] not in workbook.sheetnames:
                 raise DataImportError(f"{path.name} 中不存在工作表：{settings['sheet']}")
             sheet_names = [settings["sheet"]]
@@ -539,7 +556,8 @@ def _excel_rows(
 
 
 def _read_xls(
-    path: Path, source_bytes: bytes, source_hash: str, settings: dict[str, Any], xlrd: Any
+    path: Path, source_bytes: bytes, source_hash: str, settings: dict[str, Any], xlrd: Any,
+    selected_sheets: tuple[str, ...] | None = None,
 ) -> list[DataTable]:
     if settings["formula_policy"] == "text":
         raise DataImportError("xlrd 无法读取 .xls 公式文本；formula_policy='text' 仅适用于 .xlsx/.xlsm。")
@@ -547,7 +565,12 @@ def _read_xls(
         workbook = xlrd.open_workbook(file_contents=source_bytes, formatting_info=True)
     except Exception as exc:
         raise DataImportError(f"无法读取 XLS 文件 {path.name}：{exc}") from exc
-    if settings["sheet"] is not None:
+    if selected_sheets is not None:
+        try:
+            sheets = [workbook.sheet_by_name(name) for name in selected_sheets]
+        except xlrd.XLRDError as exc:
+            raise DataImportError(f"{path.name} 中不存在指定工作表：{exc}") from exc
+    elif settings["sheet"] is not None:
         try:
             sheet = workbook.sheet_by_name(settings["sheet"])
         except xlrd.XLRDError as exc:

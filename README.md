@@ -109,8 +109,7 @@ py -3 -m origin_bridge inspect -i .\examples_general
 py -3 -m origin_bridge plan -i .\examples_general\stress_strain.tsv `
   -o .\out\stress.opju --save .\out\stress-plan.json
 
-# 校验计划后执行
-py -3 -m origin_bridge validate .\out\stress-plan.json
+# 审阅计划后执行（执行器会校验最终计划）
 py -3 -m origin_bridge execute .\out\stress-plan.json
 
 # 只要表格，不需要 Origin 或图形
@@ -129,7 +128,7 @@ py -3 -m pip install -r requirements-agent.txt
 py -3 -m origin_bridge.mcp_server
 ```
 
-服务提供 `inspect_data`、`create_import_plan`、`validate_import_plan` 和 `execute_import_plan`。MCP 计划的默认格式为 `opju`，如要生成 XLSX 请明确传入 `output_format="xlsx"`。执行工具需要显式设置 `confirm=true`；`.opju` 仍由同一台 Windows 机器上的 Origin 生成。配置细节、计划格式和完整 agent 工作流见 [docs/agent-guide.md](docs/agent-guide.md) 与 [docs/import-plan.schema.json](docs/import-plan.schema.json)。
+服务提供 `inspect_data`、`create_import_plan`、`validate_import_plan` 和 `execute_import_plan`。通常用 `create_import_plan(include_inspection=true)` 一次获取来源摘要和计划，审阅后调用 `execute_import_plan(confirm=true)`；执行器会校验最终计划，无须固定先做独立校验。MCP 计划默认格式为 `opju`，生成 XLSX 请传入 `output_format="xlsx"`。同一服务对内容和选项未变的来源复用有界解析缓存，每次独立调用仍核对内容 SHA-256。`.opju` 由同一台 Windows 机器上的 Origin 生成。配置和计划格式见 [Agent 指南](docs/agent-guide.md) 与 [JSON Schema](docs/import-plan.schema.json)；开发检查路由见 [开发指南](docs/development.md)。
 
 ## 支持范围
 

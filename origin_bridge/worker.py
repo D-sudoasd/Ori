@@ -11,8 +11,9 @@ def execute_import_request(plan: dict[str, Any], base_dir: str | Path | None = N
     try:
         from .planning import prepare_plan
         from .exporter import execute_import
+        from .source_cache import SourceCache
 
-        prepared = prepare_plan(plan, base_dir=Path(base_dir) if base_dir is not None else None)
+        prepared = prepare_plan(plan, base_dir=Path(base_dir) if base_dir is not None else None, cache=SourceCache())
         result = execute_import(prepared)
         if not isinstance(result, dict):
             raise TypeError("导出器必须返回结果字典")

@@ -148,23 +148,31 @@ def _run_batch(args: argparse.Namespace) -> dict:
 def _dispatch(args: argparse.Namespace) -> dict:
     if args.command == "batch":
         return _run_batch(args)
+    from .source_cache import SourceCache
+
+    cache = SourceCache()
+    with cache.operation():
+        return _dispatch_cached(args, cache)
+
+
+def _dispatch_cached(args: argparse.Namespace, cache) -> dict:
     from .planning import create_plan, describe_prepared, inspect_inputs, prepare_plan
 
     if args.command in ("validate", "execute"):
         plan_path = Path(args.plan).resolve()
         plan = json.loads(plan_path.read_text(encoding="utf-8-sig"))
-        prepared = prepare_plan(plan, base_dir=plan_path.parent)
+        prepared = prepare_plan(plan, base_dir=plan_path.parent, cache=cache)
         if args.command == "validate":
             return {"ok": True, **describe_prepared(prepared)}
     else:
         paths = [Path(item) for item in args.input]
         options = _read_options(args)
         if args.command == "inspect":
-            return {"ok": True, **inspect_inputs(paths, options=options)}
+            return {"ok": True, **inspect_inputs(paths, options=options, cache=cache)}
         output = Path(args.output).resolve()
         output_format = args.format or output.suffix.lstrip(".").lower()
         plan = create_plan(paths, output, format=output_format, options=options,
-                           overwrite=args.overwrite, keep_open=args.keep_open)
+                           overwrite=args.overwrite, keep_open=args.keep_open, cache=cache)
         for entry in plan["tables"]:
             if args.plot != "auto":
                 entry["plot"]["kind"] = args.plot
@@ -175,7 +183,7 @@ def _dispatch(args: argparse.Namespace) -> dict:
                     entry["plot"]["x"] = args.x
                 if args.y is not None:
                     entry["plot"]["y"] = args.y
-        prepared = prepare_plan(plan)
+        prepared = prepare_plan(plan, cache=cache)
         if args.command == "plan":
             if args.save:
                 target = Path(args.save).resolve()

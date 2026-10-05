@@ -1,6 +1,7 @@
 """Exercise the Windows GUI executable's real bundled multiprocessing worker."""
 import multiprocessing as mp
 import multiprocessing.spawn as spawn
+import argparse
 import sys
 import tempfile
 import time
@@ -13,8 +14,8 @@ from origin_bridge.planning import create_plan  # noqa: E402
 from origin_bridge.worker import import_worker  # noqa: E402
 
 
-def main():
-    executable = str((ROOT / "dist" / "SpectraToOrigin.exe").resolve())
+def main(executable=None):
+    executable = str(Path(executable or ROOT / "dist" / "SpectraToOrigin.exe").resolve())
     with tempfile.TemporaryDirectory() as raw:
         output = Path(raw).resolve() / "from-frozen-worker.xlsx"
         plan = create_plan([ROOT / "examples_general" / "stress_strain.tsv"], output, format="xlsx")
@@ -72,4 +73,6 @@ def main():
 
 
 if __name__ == "__main__":
-    main()
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--executable", type=Path, help="要验证的 GUI executable；默认 dist/SpectraToOrigin.exe")
+    main(parser.parse_args().executable)
