@@ -380,7 +380,8 @@ def _read_inputs(
         if not isinstance(tables, list) or not tables:
             raise DataImportError(f"Reader returned no tables for {path}")
         for table in tables:
-            _validate_table_shape(table)
+            if not isinstance(table, DataTable):
+                raise DataImportError("Reader must return DataTable objects")
             _source_identity(table, path)
             _read_options_for_table(table)
             result.append((path, table))
@@ -404,6 +405,8 @@ def inspect_inputs(
 
 
 def _inspect_table(path: Path, table: DataTable) -> dict[str, Any]:
+    # A cached summary already validated these immutable columns and cell values.
+    _validate_table_shape(table)
     source_path, digest = _source_identity(table, path)
     read_options = _read_options_for_table(table)
     plot, suggestion_warnings = _suggest_plot(table)

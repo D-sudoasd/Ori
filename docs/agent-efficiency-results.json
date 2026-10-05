@@ -1,6 +1,7 @@
 {
   "date": "2026-10-05",
   "baseline_commit": "40df76fbf345afca013f5ccf3032ade2fd2d5851",
+  "measured_after_commit": "182c4cba7ef6ba220be79bb41d976acadfefdf81",
   "environment": {
     "os": "Windows",
     "python": "3.13.0",
@@ -180,13 +181,14 @@
   ],
   "validation": {
     "unittest": {
-      "total": 240,
-      "passed": 213,
+      "total": 242,
+      "passed": 215,
       "skipped_opt_in": 27,
       "failures": 0,
       "errors": 0
     },
     "packaged_checks": [
+      "CLI inspection matches source API",
       "direct TSV CLI import",
       "saved four-sheet plan CLI replay",
       "frozen GUI background worker"
@@ -212,7 +214,7 @@
       {
         "path": "origin_bridge/cli.py",
         "mode": "targeted",
-        "test_cases": 28,
+        "test_cases": 30,
         "build": false
       },
       {
@@ -227,5 +229,35 @@
         "build": true
       }
     ]
+  },
+  "final_review": {
+    "reviewed_commit": "182c4cba7ef6ba220be79bb41d976acadfefdf81",
+    "cli_inspection": {
+      "rows": 50000,
+      "columns": 2,
+      "cache_sizing_calls_before": 100002,
+      "cache_sizing_calls_after": 0,
+      "output_matches_uncached": true
+    },
+    "inspect_then_plan": {
+      "source_shape_checks_before": 2,
+      "source_shape_checks_after": 1,
+      "source_shape_checks_including_preparation_after": 2
+    },
+    "workbook_subset_and_per_sheet_options_match_uncached": true,
+    "replay": {
+      "rows_per_table": 2000,
+      "repeats": 1,
+      "task_count": 5,
+      "table_content_matches_baseline": true,
+      "work_counts_match_recorded_results": true,
+      "timings_not_used_to_replace_five_repeat_medians": true
+    },
+    "native_test_routing_restored": {
+      "origin_bridge/cli.py": ["test_generic_origin"],
+      "origin_bridge/exporter.py": ["test_generic_origin", "test_batch_origin"],
+      "origin_bridge/gui.py": ["test_batch_gui"],
+      "origin_bridge/source_summary.py": ["test_batch_gui"]
+    }
   }
 }

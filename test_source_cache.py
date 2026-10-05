@@ -40,14 +40,16 @@ class SourceCacheTests(unittest.TestCase):
 
         with self.parser() as parse, mock.patch.object(Path, "read_bytes", read), mock.patch.object(
             planning, "_column_range", wraps=planning._column_range
-        ) as ranges:
+        ) as ranges, mock.patch.object(planning, "_validate_table_shape", wraps=planning._validate_table_shape) as shapes:
             first = planning.inspect_inputs([self.source], cache=cache)
             second = planning.inspect_inputs([self.source], cache=cache)
             plan = planning.create_plan([self.source], self.output, format="xlsx", cache=cache)
+            self.assertEqual(shapes.call_count, 1, "unchanged summaries reuse source-shape validation")
             prepared = planning.prepare_plan(plan, cache=cache)
         self.assertEqual(first, second)
         self.assertEqual(parse.call_count, 1)
         self.assertEqual(ranges.call_count, 2)
+        self.assertEqual(shapes.call_count, 2, "preparation still validates the source table")
         self.assertEqual(len(reads), 4, "each independent decision must verify fresh bytes")
         self.assertEqual(prepared.tables[0].table.columns[1].values, ("1", "2"))
         self.assertFalse(self.output.exists())
@@ -59,6 +61,57 @@ class SourceCacheTests(unittest.TestCase):
         self.assertEqual(parse.call_count, 1)
         self.assertTrue(receipt["ok"])
         self.assertTrue(self.output.exists())
+
+    def test_cli_inspection_does_not_size_an_unused_cache(self):
+        expected = {"ok": True, **planning.inspect_inputs([self.source])}
+        args = cli.build_parser().parse_args(["inspect", "-i", str(self.source)])
+        with self.parser() as parse, mock.patch.object(source_cache.sys, "getsizeof") as sizes:
+            inspected = cli._dispatch(args)
+        self.assertEqual(inspected, expected)
+        sizes.assert_not_called()
+        parse.assert_not_called()  # The ordinary reader parsed the source, without cache bookkeeping.
+
+    def test_workbook_subset_aliases_and_per_sheet_options_match_uncached_replay(self):
+        path = self.root / "varied.xlsx"
+        book = Workbook()
+        layouts = {
+            "Header1": [["X", "Y"], [1, 10]],
+            "Header2": [["X", "Y"], [2, 20]],
+            "Values": [[3, 30], [4, 40]],
+            "Skipped": [["metadata", "v2"], ["X", "Y"], [5, 50]],
+        }
+        for index, (name, rows) in enumerate(layouts.items()):
+            sheet = book.active if index == 0 else book.create_sheet()
+            sheet.title = name
+            for row in rows:
+                sheet.append(row)
+        book.save(path)
+        book.close()
+        requests = (
+            {"sheet": "Header1"}, {"sheet": "Header2"}, {"sheet": "Values", "header": False},
+            {"sheet": "Skipped", "header": True, "skip_rows": 1, "missing_values": ["50"]},
+        )
+        plan = None
+        for options in requests:
+            part = planning.create_plan([path], self.output, format="xlsx", options=options)
+            if plan is None:
+                plan = part
+            else:
+                plan["tables"].extend(part["tables"])
+        expected = planning.prepare_plan(plan)
+        for warm in (False, True):
+            with self.subTest(warm=warm), self.parser() as parse:
+                cache = SourceCache()
+                if warm:
+                    cache.read(path)
+                    subset = cache.read_sheets(path, ("Header2", "Header1"), {"header": True})
+                    self.assertEqual([table.source_sheet for table in subset], ["Header2", "Header1"])
+                    self.assertEqual(parse.call_count, 1, "selected sheets reuse their existing aliases")
+                prepared = planning.prepare_plan(plan, cache=cache)
+                self.assertEqual(prepared, expected)
+                self.assertEqual(parse.call_count, 2 if warm else 3)
+                self.assertEqual(prepared.tables[2].table.columns[0].values, ("3", "4"))
+                self.assertEqual(prepared.tables[3].table.columns[1].values, (None,))
 
     def test_same_size_same_mtime_change_invalidates_and_rejects_old_plan(self):
         cache = SourceCache()

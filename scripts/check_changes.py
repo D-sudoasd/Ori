@@ -18,14 +18,14 @@ BUILD = {
     "build_exe.bat", "run.bat",
 }
 LEAF = {
-    "origin_bridge/cli.py": {"test_generic_cli", "test_batch_review"},
+    "origin_bridge/cli.py": {"test_generic_cli", "test_generic_origin", "test_batch_review"},
     "origin_bridge/mcp_server.py": {"test_mcp_server"},
-    "origin_bridge/gui.py": {"test_generic_gui"},
+    "origin_bridge/gui.py": {"test_generic_gui", "test_batch_gui"},
     "origin_bridge/gui_drive.py": {"test_batch_gui", "test_generic_gui"},
     "origin_bridge/batch.py": {"test_batch", "test_batch_gui", "test_batch_origin", "test_batch_review"},
     "origin_bridge/batch_config.py": {"test_batch_gui"},
-    "origin_bridge/source_summary.py": {"test_generic_gui"},
-    "origin_bridge/exporter.py": {"test_generic_exporter", "test_generic_cli", "test_generic_gui", "test_batch", "test_mcp_server"},
+    "origin_bridge/source_summary.py": {"test_generic_gui", "test_batch_gui"},
+    "origin_bridge/exporter.py": {"test_generic_exporter", "test_generic_cli", "test_generic_gui", "test_generic_origin", "test_batch", "test_batch_origin", "test_mcp_server"},
 }
 BUILD_CHECKS = {"scripts/verify_packaged_worker.py"}
 IMAGES = {".png", ".jpg", ".jpeg", ".gif", ".webp", ".svg", ".bmp", ".tif", ".tiff", ".ico"}

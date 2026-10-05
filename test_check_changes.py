@@ -50,6 +50,7 @@ class ChangeRoutingTests(unittest.TestCase):
                 "test_generic_cli",
                 "test_generic_exporter",
                 "test_generic_gui",
+                "test_generic_origin",
             ],
         )
         self.assertEqual(plan["agent_unittest_args"], ["test_mcp_server"])
@@ -60,7 +61,7 @@ class ChangeRoutingTests(unittest.TestCase):
         plan = route_changes([Change("origin_bridge/exporter.py")])
         self.assertEqual(
             plan["unittest_args"],
-            ["test_batch", "test_generic_cli", "test_generic_exporter", "test_generic_gui"],
+            ["test_batch", "test_batch_origin", "test_generic_cli", "test_generic_exporter", "test_generic_gui", "test_generic_origin"],
         )
         self.assertEqual(plan["agent_unittest_args"], ["test_mcp_server"])
         self.assertTrue(plan["agent"])
@@ -76,9 +77,10 @@ class ChangeRoutingTests(unittest.TestCase):
 
     def test_cli_batch_configuration_and_source_summaries_cover_callers(self) -> None:
         cases = {
-            "origin_bridge/cli.py": ["test_batch_review", "test_generic_cli"],
+            "origin_bridge/cli.py": ["test_batch_review", "test_generic_cli", "test_generic_origin"],
             "origin_bridge/batch_config.py": ["test_batch_gui"],
-            "origin_bridge/source_summary.py": ["test_generic_gui"],
+            "origin_bridge/gui.py": ["test_batch_gui", "test_generic_gui"],
+            "origin_bridge/source_summary.py": ["test_batch_gui", "test_generic_gui"],
         }
         for path, expected in cases.items():
             with self.subTest(path=path):

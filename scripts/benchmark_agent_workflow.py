@@ -9,7 +9,6 @@ import argparse
 import asyncio
 import contextlib
 import hashlib
-import inspect
 import io
 import json
 import statistics
@@ -131,20 +130,34 @@ def replay(root, rows):
             async def call(name, arguments):
                 counts["tool_calls"] += 1
                 result = await server.call_tool(name, arguments)
+                assert not result.is_error, result.content
+                assert isinstance(result.structured_content, dict), result.structured_content
                 return result.structured_content
+
+            def check_inspection(payload):
+                assert len(payload["tables"]) == 1, payload
+                table = payload["tables"][0]
+                assert table["n_rows"] == rows and len(table["columns"]) == 2, table
+                assert all(column["kind"] == "number" for column in table["columns"]), table
 
             async def run():
                 if checks:
-                    await call("inspect_data", {"paths": [str(source)]})
+                    check_inspection(await call("inspect_data", {"paths": [str(source)]}))
                 arguments = {"paths": [str(source)], "output_path": str(target), "output_format": "xlsx"}
-                tool = server._tool_manager.get_tool("create_import_plan")
-                combined = not checks and "include_inspection" in inspect.signature(tool.fn).parameters
+                combined = False
+                if not checks:
+                    tools = await server.list_tools()
+                    schema = next(tool for tool in tools if tool.name == "create_import_plan").model_dump(by_alias=True)
+                    combined = "include_inspection" in schema["inputSchema"]["properties"]
                 if combined:
                     arguments["include_inspection"] = True
                 planned = await call("create_import_plan", arguments)
                 plan = planned["plan"] if combined else planned
+                if combined:
+                    check_inspection(planned["inspection"])
                 if checks:
-                    await call("validate_import_plan", {"plan": plan})
+                    validated = await call("validate_import_plan", {"plan": plan})
+                    assert validated["valid"] is True, validated
                 receipt = await call("execute_import_plan", {"plan": plan, "confirm": True})
                 assert receipt["ok"], receipt
             asyncio.run(run())

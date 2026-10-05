@@ -148,6 +148,9 @@ def _run_batch(args: argparse.Namespace) -> dict:
 def _dispatch(args: argparse.Namespace) -> dict:
     if args.command == "batch":
         return _run_batch(args)
+    if args.command == "inspect":
+        # A one-shot inspection has no later step that can reuse parsed tables.
+        return _dispatch_cached(args, None)
     from .source_cache import SourceCache
 
     cache = SourceCache()
