@@ -23,6 +23,18 @@ Ori imports typed text tables, Excel sheets, and flat JSON data. Inspect columns
 
 导出 OPJU 需要可用的 Windows OriginPro；XLSX 只生成表格。程序保留原值、类型、单位和缺失值，不插值、拟合、平滑或自动换算单位。旧两列光谱/XRD 流程继续保留。
 
+## 原理示意 / Principle schematic
+
+<p align="center">
+  <img src="assets/readme/principle.png" width="100%" alt="类型化表格、X/Y/误差列映射及 OPJU/XLSX 输出区别 — conceptual schematic / 概念示意图">
+</p>
+
+*概念示意：导入计划为原始表格指定 X、Y 和误差列并保存来源哈希；OPJU 可含表格与图形，XLSX 输出只有表格，类型、单位和缺失值应保留。图中曲线是合成示意，不是实验结果。*
+
+*Conceptual schematic: an import plan maps X, Y and error columns and retains source hashes; OPJU can contain tables and graphs, whereas XLSX export contains tables only. Types, units and missing values are preserved; the curve is synthetic, not an experimental result.*
+
+[查看完整示意图 / View full-size schematic](assets/readme/principle.png)
+
 ## 开始使用
 
 Windows 用户从源码运行（Python 3.10+）：
