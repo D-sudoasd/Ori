@@ -1,3 +1,7 @@
+<p align="center">
+  <img src="assets/readme/hero.png" width="100%" alt="Ori — Import research tables into editable Origin projects / 将科研表格导入可编辑的 Origin 工程. Conceptual illustration / 概念插图。">
+</p>
+
 # Ori
 
 **将常见科研表格导入可编辑的 Origin 工程，或只导出带来源信息的 Excel 工作簿。**
@@ -8,16 +12,12 @@ Ori imports typed text tables, Excel sheets, and flat JSON data. Inspect columns
 
 [![MIT](https://img.shields.io/badge/License-MIT-455A64)](LICENSE)
 
-```mermaid
-flowchart TD
-  A[文本表格、Excel 或扁平 JSON] --> B[检查工作表、列类型与样例]
-  B --> C[审阅导入计划和 X / Y 映射]
-  C --> D{输出格式}
-  D -->|Windows + OriginPro| E[OPJU 表格与可编辑图形]
-  D -->|无需 Origin| F[XLSX 数据表]
-  E --> G[来源工作表、设置和内容哈希]
-  F --> G
-```
+<picture>
+  <source media="(max-width: 600px)" srcset="assets/readme/diagrams/workflow-readme-md-1-mobile.svg">
+  <img src="assets/readme/diagrams/workflow-readme-md-1.svg" width="100%" alt="Ori — workflow schematic / 流程示意图">
+</picture>
+
+<sub>[Editable diagram source / 可编辑图源](assets/readme/diagrams/workflow-readme-md-1.mmd)</sub>
 
 **先检查一个仓库示例：** 在安装依赖后运行 `py -3 -m origin_bridge inspect -i ./examples_general`。该命令返回表格摘要，不写输出或启动 Origin。
 
